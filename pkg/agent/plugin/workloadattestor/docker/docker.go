@@ -24,11 +24,10 @@ import (
 )
 
 const (
-	pluginName                   = "docker"
-	subselectorLabel             = "label"
-	subselectorImageID           = "image_id"
-	subselectorEnv               = "env"
-	subselectorImageConfigDigest = "image_config_digest"
+	pluginName         = "docker"
+	subselectorLabel   = "label"
+	subselectorImageID = "image_id"
+	subselectorEnv     = "env"
 )
 
 func BuiltIn() catalog.BuiltIn {
@@ -152,21 +151,11 @@ func (p *Plugin) Attest(ctx context.Context, req *workloadattestorv1.AttestReque
 
 	selectors := getSelectorValuesFromConfig(container.Config)
 
-	var imageJSON image.InspectResponse
-	var inspectErr error
-	imageName := container.Config.Image
-	if imageName != "" || p.sigstoreVerifier != nil {
-		imageJSON, _, inspectErr = p.docker.ImageInspectWithRaw(ctx, imageName)
-	}
-
-	// Add image_config_digest selector
-	if inspectErr == nil && imageJSON.ID != "" {
-		selectors = append(selectors, fmt.Sprintf("%s:%s", subselectorImageConfigDigest, imageJSON.ID))
-	}
-
 	if p.sigstoreVerifier != nil {
-		if inspectErr != nil {
-			return nil, fmt.Errorf("failed to inspect image %q: %w", imageName, inspectErr)
+		imageName := container.Config.Image
+		imageJSON, _, err := p.docker.ImageInspectWithRaw(ctx, imageName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect image %q: %w", imageName, err)
 		}
 
 		if len(imageJSON.RepoDigests) == 0 {
