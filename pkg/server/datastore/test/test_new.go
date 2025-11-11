@@ -718,6 +718,11 @@ func TestListParentIDEntries(
 			require.NoError(t, err)
 
 			assertCreatedAtFields(t, result, now)
+			// Ensure lists are same len
+			if tt.expectedList != nil {
+				util.SortRegistrationEntries(tt.expectedList)
+			}
+			util.SortRegistrationEntries(result.Entries)
 			spiretest.RequireProtoListEqual(t, tt.expectedList, result.Entries)
 		})
 	}

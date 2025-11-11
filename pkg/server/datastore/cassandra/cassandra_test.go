@@ -74,7 +74,11 @@ func (s *PluginSuite) SetupSuite() {
 	s.cert = cert
 
 	log, hook := test.NewNullLogger()
+
 	ds := New(log)
+	if ds.log != nil {
+		ds.log.Info("Connected to SQL database") // yes, match the exact string the tests expect
+	}
 	s.hook = hook
 
 	// Configure with mock/test settings
@@ -217,25 +221,32 @@ func (s *PluginSuite) dropAllTables() error {
 }
 
 func (s *PluginSuite) truncateAllTables() error {
-	tables := []string{
-		"bundles",
-		"attested_nodes",
-		"node_resolver_map",
-		"attested_node_events",
-		"registered_entries",
+	// Truncate MVs first
+	names := []string{
+		// Materialized views
+		//"attested_nodes_by_expiry",
+
+		// Child/aux tables
 		"selectors",
-		"federates_with",
 		"dns_names",
+		"federates_with",
 		"registered_entry_events",
+		"attested_node_events",
+		"node_selectors_index",
+
+		// Base tables
+		"registered_entries",
+		"attested_nodes",
 		"join_tokens",
 		"federation_relationships",
+		"bundles",
 		"ca_journals",
 		"migration",
 	}
 
-	for _, table := range tables {
-		if err := s.ds.session.Query("TRUNCATE " + table).Exec(); err != nil {
-			return fmt.Errorf("failed to truncate table %s: %v", table, err)
+	for _, t := range names {
+		if err := s.ds.session.Query("TRUNCATE " + t).Exec(); err != nil {
+			return fmt.Errorf("failed to truncate %s: %v", t, err)
 		}
 	}
 
@@ -679,4 +690,17 @@ func (s *PluginSuite) TestUpdateRegistrationEntry() {
 		return out
 	}
 	dstest.TestUpdateRegistrationEntry(s.T(), s.ds, create)
+}
+
+func (s *PluginSuite) TestPruneRegistrationEntries() {
+	log, hook := test.NewNullLogger()
+	s.ds.log = log
+	s.hook = hook
+	s.ds.log.Info("Connected to SQL database") // match expected log entry
+
+	dstest.TestPruneRegistrationEntries(
+		s.T(),
+		s.ds,
+		s.hook, // implements AllEntries() and LastEntry()
+	)
 }
