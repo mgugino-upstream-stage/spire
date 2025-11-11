@@ -151,17 +151,88 @@ func (ds *CassandraDataStore) AppendBundle(ctx context.Context, b *common.Bundle
 	return mergedBundle, nil
 }
 
-// DeleteBundle deletes the bundle with the matching specified TrustDomain. Any CACert data passed is ignored.
 func (ds *CassandraDataStore) DeleteBundle(ctx context.Context, trustDomainID string, mode datastore.DeleteMode) error {
 	if trustDomainID == "" {
 		return newError("invalid request: missing trust domain ID")
 	}
 
-	query := `DELETE FROM bundles WHERE bucket = ? AND trust_domain = ?`
-	if err := ds.session.Query(query, bundleBucket, trustDomainID).Exec(); err != nil {
-		return newError("failed to delete bundle: %v", err)
+	switch mode {
+	case datastore.Restrict:
+		// block if any references exist
+		var count int64
+		const refQ = `SELECT COUNT(*) FROM federates_with WHERE trust_domain = ? ALLOW FILTERING`
+		if err := ds.session.Query(refQ, trustDomainID).Scan(&count); err != nil {
+			return newError("failed to check bundle references: %v", err)
+		}
+		if count > 0 {
+			return newError("datastore-sql: cannot delete bundle; federated with %d registration entries", count)
+		}
+
+	case datastore.Delete:
+		// delete entries that reference this bundle
+		const listQ = `SELECT entry_id FROM federates_with WHERE trust_domain = ? ALLOW FILTERING`
+		iter := ds.session.Query(listQ, trustDomainID).Iter()
+		var entryID string
+		for iter.Scan(&entryID) {
+			if err := ds.session.Query(`DELETE FROM selectors         WHERE entry_id = ?`, entryID).Exec(); err != nil {
+				iter.Close()
+				return newError("failed to delete selectors for entry %q: %v", entryID, err)
+			}
+			if err := ds.session.Query(`DELETE FROM dns_names         WHERE entry_id = ?`, entryID).Exec(); err != nil {
+				iter.Close()
+				return newError("failed to delete dns names for entry %q: %v", entryID, err)
+			}
+			if err := ds.session.Query(`DELETE FROM federates_with    WHERE entry_id = ?`, entryID).Exec(); err != nil {
+				iter.Close()
+				return newError("failed to delete federates_with for entry %q: %v", entryID, err)
+			}
+			if err := ds.session.Query(`DELETE FROM registered_entries WHERE entry_id = ?`, entryID).Exec(); err != nil {
+				iter.Close()
+				return newError("failed to delete registration entry %q: %v", entryID, err)
+			}
+		}
+		if err := iter.Close(); err != nil {
+			return newError("failed to iterate federated entries: %v", err)
+		}
+
+	case datastore.Dissociate:
+		// remove ONLY the association to this trust domain; keep entries
+		const listQ = `SELECT entry_id FROM federates_with WHERE trust_domain = ? ALLOW FILTERING`
+		iter := ds.session.Query(listQ, trustDomainID).Iter()
+		var entryID string
+		for iter.Scan(&entryID) {
+			// delete the single row for (entry_id, trust_domain)
+			if err := ds.session.Query(
+				`DELETE FROM federates_with WHERE entry_id = ? AND trust_domain = ?`,
+				entryID, trustDomainID,
+			).Exec(); err != nil {
+				iter.Close()
+				return newError("failed to dissociate entry %q from %q: %v", entryID, trustDomainID, err)
+			}
+
+			// (Optional but closer to sqlstore semantics)
+			// touch updated_at to reflect the dissociation
+			if err := ds.session.Query(
+				`UPDATE registered_entries SET updated_at = ? WHERE entry_id = ?`,
+				time.Now(), entryID,
+			).Exec(); err != nil {
+				iter.Close()
+				return newError("failed to update registration entry timestamp for %q: %v", entryID, err)
+			}
+
+			// (Optional) emit an entry event if your sqlstore does on dissociation
+			// _ = ds.createRegistrationEntryEventForEntryID(entryID)
+		}
+		if err := iter.Close(); err != nil {
+			return newError("failed to iterate federated entries for dissociation: %v", err)
+		}
 	}
 
+	// finally, remove the bundle itself
+	const delBundleQ = `DELETE FROM bundles WHERE bucket = ? AND trust_domain = ?`
+	if err := ds.session.Query(delBundleQ, bundleBucket, trustDomainID).Exec(); err != nil {
+		return newError("failed to delete bundle: %v", err)
+	}
 	return nil
 }
 

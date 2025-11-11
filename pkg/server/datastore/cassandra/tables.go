@@ -109,10 +109,11 @@ var TableDefinitions = []string{
 
 	// Registration entry events table
 	`CREATE TABLE IF NOT EXISTS registered_entry_events (
-		event_id timeuuid PRIMARY KEY,
-		entry_id text,
-		created_at timestamp
-	);`,
+  bucket     text,        -- always 'registered_entry_events'
+  created_at timeuuid,    -- time-ordered clustering key
+  entry_id   text,
+  PRIMARY KEY ((bucket), created_at)
+) WITH CLUSTERING ORDER BY (created_at ASC);`,
 
 	// Join tokens table - temporary tokens for agent joining (no bucket)
 	`CREATE TABLE IF NOT EXISTS join_tokens (

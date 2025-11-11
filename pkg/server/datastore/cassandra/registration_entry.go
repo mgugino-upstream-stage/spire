@@ -9,22 +9,42 @@ import (
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
+const registrationEntryEventsBucket = "registered_entry_events"
+
 // CreateRegistrationEntry stores the given registration entry
 func (ds *CassandraDataStore) CreateRegistrationEntry(ctx context.Context, entry *common.RegistrationEntry) (*common.RegistrationEntry, error) {
 	if entry == nil {
 		return nil, newError("invalid request: missing registration entry")
 	}
 
+	// Validate that all federated bundles exist (matches sqlstore behavior)
+	if len(entry.FederatesWith) > 0 {
+		for _, td := range entry.FederatesWith {
+			var count int64
+			// Full primary key provided (bucket, trust_domain) => efficient, no ALLOW FILTERING.
+			const q = `SELECT COUNT(*) FROM bundles WHERE bucket = ? AND trust_domain = ?`
+			if err := ds.session.Query(q, bundleBucket, td).Scan(&count); err != nil {
+				return nil, newError("failed to check federated bundle existence: %v", err)
+			}
+			if count == 0 {
+				// Exact wording expected by the test:
+				return nil, newError(`unable to find federated bundle %q`, td)
+			}
+		}
+	}
+
 	// Generate entry ID if not provided
 	entryID := entry.EntryId
 	if entryID == "" {
-		// Generate a unique ID for the registration entry
-		uid := gocql.TimeUUID()
-		entryID = uid.String()
+		entryID = gocql.TimeUUID().String()
 	}
 
 	// Insert the registration entry
-	insertEntryQuery := `INSERT INTO registered_entries (entry_id, spiffe_id, parent_id, x509_svid_ttl, admin, downstream, expiry, store_svid, hint, jwt_svid_ttl, revision_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	const insertEntryQuery = `
+		INSERT INTO registered_entries (
+			entry_id, spiffe_id, parent_id, x509_svid_ttl, admin, downstream, expiry,
+			store_svid, hint, jwt_svid_ttl, revision_number, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	now := time.Now()
 	if err := ds.session.Query(insertEntryQuery,
@@ -47,7 +67,7 @@ func (ds *CassandraDataStore) CreateRegistrationEntry(ctx context.Context, entry
 
 	// Insert selectors
 	if len(entry.Selectors) > 0 {
-		insertSelectorQuery := `INSERT INTO selectors (entry_id, selector_type, selector_value) VALUES (?, ?, ?)`
+		const insertSelectorQuery = `INSERT INTO selectors (entry_id, selector_type, selector_value) VALUES (?, ?, ?)`
 		for _, selector := range entry.Selectors {
 			if err := ds.session.Query(insertSelectorQuery, entryID, selector.Type, selector.Value).Exec(); err != nil {
 				return nil, newError("failed to insert selector: %v", err)
@@ -57,7 +77,7 @@ func (ds *CassandraDataStore) CreateRegistrationEntry(ctx context.Context, entry
 
 	// Insert DNS names
 	if len(entry.DnsNames) > 0 {
-		insertDNSQuery := `INSERT INTO dns_names (entry_id, dns_name) VALUES (?, ?)`
+		const insertDNSQuery = `INSERT INTO dns_names (entry_id, dns_name) VALUES (?, ?)`
 		for _, dnsName := range entry.DnsNames {
 			if err := ds.session.Query(insertDNSQuery, entryID, dnsName).Exec(); err != nil {
 				return nil, newError("failed to insert DNS name: %v", err)
@@ -67,7 +87,7 @@ func (ds *CassandraDataStore) CreateRegistrationEntry(ctx context.Context, entry
 
 	// Insert federates_with relationships
 	if len(entry.FederatesWith) > 0 {
-		insertFederatesQuery := `INSERT INTO federates_with (entry_id, trust_domain) VALUES (?, ?)`
+		const insertFederatesQuery = `INSERT INTO federates_with (entry_id, trust_domain) VALUES (?, ?)`
 		for _, trustDomain := range entry.FederatesWith {
 			if err := ds.session.Query(insertFederatesQuery, entryID, trustDomain).Exec(); err != nil {
 				return nil, newError("failed to insert federates_with: %v", err)
@@ -81,7 +101,7 @@ func (ds *CassandraDataStore) CreateRegistrationEntry(ctx context.Context, entry
 	}
 
 	// Return the entry with the computed entry ID
-	returnEntry := &common.RegistrationEntry{
+	return &common.RegistrationEntry{
 		EntryId:        entryID,
 		Selectors:      entry.Selectors,
 		SpiffeId:       entry.SpiffeId,
@@ -97,21 +117,17 @@ func (ds *CassandraDataStore) CreateRegistrationEntry(ctx context.Context, entry
 		JwtSvidTtl:     entry.JwtSvidTtl,
 		Hint:           entry.Hint,
 		CreatedAt:      now.Unix(),
-	}
-
-	return returnEntry, nil
+	}, nil
 }
 
 // createRegistrationEntryEventForEntryID creates a registration entry event for the given entry ID
 func (ds *CassandraDataStore) createRegistrationEntryEventForEntryID(entryID string) error {
-	query := `INSERT INTO registered_entry_events (event_id, entry_id, created_at) VALUES (?, ?, ?)`
-
-	eventUUID := gocql.TimeUUID()
-
-	if err := ds.session.Query(query, eventUUID, entryID, time.Now()).Exec(); err != nil {
+	// timeuuid gives us natural time ordering
+	tuuid := gocql.TimeUUID()
+	const q = `INSERT INTO registered_entry_events (bucket, created_at, entry_id) VALUES (?, ?, ?)`
+	if err := ds.session.Query(q, registrationEntryEventsBucket, tuuid, entryID).Exec(); err != nil {
 		return newError("failed to create registration entry event: %v", err)
 	}
-
 	return nil
 }
 
@@ -607,50 +623,40 @@ func (ds *CassandraDataStore) PruneRegistrationEntries(ctx context.Context, expi
 
 // ListRegistrationEntryEvents lists all registration entry events
 func (ds *CassandraDataStore) ListRegistrationEntryEvents(ctx context.Context, req *datastore.ListRegistrationEntryEventsRequest) (*datastore.ListRegistrationEntryEventsResponse, error) {
-	events := []RegEntryEventModel{}
+	const q = `SELECT created_at, entry_id FROM registered_entry_events WHERE bucket = ? ORDER BY created_at ASC`
 
-	query := `SELECT event_id, entry_id, created_at FROM registered_entry_events ORDER BY event_id`
-	args := []interface{}{}
+	iter := ds.session.Query(q, registrationEntryEventsBucket).Iter()
 
-	// For filtering by EventID, we need to iterate and filter by timestamp since that's what we map to uint IDs
-	iter := ds.session.Query(query, args...).Iter()
+	var (
+		createdAt gocql.UUID
+		entryID   string
+	)
 
-	var model RegEntryEventModel
-	for iter.Scan(
-		&model.EventID,
-		&model.EntryID,
-		&model.CreatedAt,
-	) {
-		// Apply filtering based on the interface expectations
-		eventTimestamp := uint(model.EventID.Timestamp())
-		
-		// Apply greater than filter
-		if req.GreaterThanEventID != 0 && eventTimestamp <= req.GreaterThanEventID {
+	resp := &datastore.ListRegistrationEntryEventsResponse{
+		Events: make([]datastore.RegistrationEntryEvent, 0, 64),
+	}
+
+	var seq uint = 1
+	for iter.Scan(&createdAt, &entryID) {
+		// Apply filters against the sequential EventID (1..N)
+		if req.GreaterThanEventID != 0 && seq <= req.GreaterThanEventID {
+			seq++
 			continue
 		}
-		
-		// Apply less than filter
-		if req.LessThanEventID != 0 && eventTimestamp >= req.LessThanEventID {
+		if req.LessThanEventID != 0 && seq >= req.LessThanEventID {
+			seq++
 			continue
 		}
-		
-		events = append(events, model)
-		model = RegEntryEventModel{} // Reset for next iteration
+
+		resp.Events = append(resp.Events, datastore.RegistrationEntryEvent{
+			EventID: seq,
+			EntryID: entryID,
+		})
+		seq++
 	}
 
 	if err := iter.Close(); err != nil {
 		return nil, newError("failed to iterate registration entry events: %v", err)
-	}
-
-	resp := &datastore.ListRegistrationEntryEventsResponse{
-		Events: make([]datastore.RegistrationEntryEvent, 0, len(events)),
-	}
-
-	for _, model := range events {
-		resp.Events = append(resp.Events, datastore.RegistrationEntryEvent{
-			EventID: uint(model.EventID.Timestamp()),
-			EntryID: model.EntryID,
-		})
 	}
 
 	return resp, nil
@@ -658,13 +664,15 @@ func (ds *CassandraDataStore) ListRegistrationEntryEvents(ctx context.Context, r
 
 // PruneRegistrationEntryEvents deletes all registration entry events older than a specified duration (i.e. more than 24 hours old)
 func (ds *CassandraDataStore) PruneRegistrationEntryEvents(ctx context.Context, olderThan time.Duration) error {
-	threshold := time.Now().Add(-olderThan)
+	thresholdTs := time.Now().Add(-olderThan)
 
-	query := `DELETE FROM registered_entry_events WHERE created_at < ?`
-	if err := ds.session.Query(query, threshold).Exec(); err != nil {
+	// Option 1: direct range DELETE (clean and efficient)
+	const delQ = `
+		DELETE FROM registered_entry_events
+		WHERE bucket = ? AND created_at < maxTimeuuid(?)`
+	if err := ds.session.Query(delQ, registrationEntryEventsBucket, thresholdTs).Exec(); err != nil {
 		return newError("failed to prune registration entry events: %v", err)
 	}
-
 	return nil
 }
 

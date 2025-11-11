@@ -132,7 +132,6 @@ func (s *PluginSuite) TestFetchAttestedNodeMissing() {
 	dstest.TestFetchAttestedNodeMissing(s.T(), s.ds)
 }
 
-// wip
 func (s *PluginSuite) TestFetchFederationRelationship() {
 	// createRaw inserts a raw federated trust domain record into the SQL database.
 	createRaw := func(r dstest.FederatedTrustDomainRaw) error {
@@ -172,7 +171,123 @@ func (s *PluginSuite) TestDeleteFederationRelationship() {
 	dstest.TestDeleteFederationRelationship(s.T(), s.ds)
 }
 
-// Having replicated yet
+// Haven't replicated yet
+
+// SQL wrapper (keeps your method name; just delegates to the stand-alone test with a fresh DS)
+func (s *PluginSuite) TestPruneRegistrationEntryEvents() {
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		return ds, func() { ds.Close() }
+	}
+
+	ds, cleanup := newDS()
+	defer cleanup()
+
+	// Run the migrated test against a fresh datastore so EventIDs start at 1
+	dstest.TestPruneRegistrationEntryEvents(s.T(), ds)
+}
+
+func (s *PluginSuite) TestListRegistrationEntryEvents() {
+	// Delegate to the shared standalone test (no extra callbacks needed).
+	dstest.TestListRegistrationEntryEvents(s.T(), s.ds)
+}
+
+func (s *PluginSuite) TestListEntriesBySelectorMatchAny() {
+	// newDS: returns a fresh datastore and a cleanup that closes it
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		return ds, func() { ds.Close() }
+	}
+
+	// loadEntries: adapt s.getTestDataFromJSONFile(path string, jsonValue any)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
+
+	dstest.TestListEntriesBySelectorMatchAny(
+		s.T(),
+		newDS,
+		loadEntries,
+	)
+}
+
+func (s *PluginSuite) TestListEntriesByFederatesWithSuperset() {
+	// newDS: returns a fresh datastore and a cleanup that calls Close()
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		cleanup := func() { ds.Close() }
+		return ds, cleanup
+	}
+
+	// loadEntries: adapt s.getTestDataFromJSONFile(path string, jsonValue any)
+	// to the signature the shared test expects: func(path string, out *[]*common.RegistrationEntry)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
+
+	// Delegate to the shared dstest body
+	dstest.TestListEntriesByFederatesWithSuperset(
+		s.T(),
+		newDS,       // creates a ds and auto-closes it via returned cleanup
+		loadEntries, // loads testdata/entries_federates_with.json into []*common.RegistrationEntry
+	)
+}
+
+func (s *PluginSuite) TestListEntriesByFederatesWithMatchAny() {
+	// newDS: returns a fresh datastore and a cleanup func that closes it
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		return ds, func() { ds.Close() }
+	}
+
+	// loadEntries: adapt s.getTestDataFromJSONFile(path, any)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
+
+	dstest.TestListEntriesByFederatesWithMatchAny(
+		s.T(),
+		newDS,
+		loadEntries,
+	)
+}
+
+func (s *PluginSuite) TestListEntriesByFederatesWithSubset() {
+	// newDS: returns a fresh datastore, with Close() encapsulated in the cleanup func
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		return ds, func() { ds.Close() }
+	}
+
+	// Load test entries from JSON (reusing your helper)
+	allEntries := make([]*common.RegistrationEntry, 0)
+	s.getTestDataFromJSONFile(filepath.Join("testdata", "entries_federates_with.json"), &allEntries)
+
+	// Delegate to shared test body
+	dstest.TestListEntriesByFederatesWithSubset(
+		s.T(),
+		newDS,
+		allEntries,
+	)
+}
+
+func (s *PluginSuite) TestListEntriesByFederatesWithExact() {
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		return ds, func() { ds.Close() }
+	}
+
+	dstest.TestListEntriesByFederatesWithExact(
+		s.T(),
+		newDS,
+	)
+}
 
 func (s *PluginSuite) TestListSelectorEntriesSuperset() {
 	// Prepare the static test data once here
@@ -335,6 +450,7 @@ func (s *PluginSuite) TestListRegistrationEntriesWhenCruftRowsExist() {
 }
 
 func (s *PluginSuite) TestListRegistrationEntries() {
+	ctx := context.Background()
 	// Connection is never used, each test creates new connection to a different database
 	s.ds.Close()
 

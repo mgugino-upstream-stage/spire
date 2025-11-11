@@ -10,6 +10,7 @@ import (
 
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/server/datastore"
 	dstest "github.com/spiffe/spire/pkg/server/datastore/test"
 	"github.com/spiffe/spire/test/clock"
 	"github.com/spiffe/spire/test/spiretest"
@@ -238,7 +239,7 @@ func (s *PluginSuite) truncateAllTables() error {
 	return nil
 }
 
-/*
+/**/
 func (s *PluginSuite) TestBundleCRUD() {
 	dstest.TestBundleCRUD(s.T(), s.ds, s.cert, s.cacert)
 }
@@ -372,8 +373,6 @@ func (s *PluginSuite) TestFetchAttestedNodeMissing() {
 	dstest.TestFetchAttestedNodeMissing(s.T(), s.ds)
 }
 
-// WIP
-
 func (s *PluginSuite) TestCountRegistrationEntries() {
 	dstest.TestCountRegistrationEntries(s.T(), s.ds)
 }
@@ -387,8 +386,8 @@ func (s *PluginSuite) TestFetchFederationRelationship() {
 	rawCreate := func(raw dstest.FederatedTrustDomainRaw) error {
 		return s.ds.session.Query(
 			`INSERT INTO federation_relationships
-				 (bucket, trust_domain, bundle_endpoint_url, bundle_endpoint_profile, endpoint_spiffe_id, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					 (bucket, trust_domain, bundle_endpoint_url, bundle_endpoint_profile, endpoint_spiffe_id, created_at, updated_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			federationBucket,
 			raw.TrustDomain,
 			raw.BundleEndpointURL,
@@ -427,13 +426,9 @@ func (s *PluginSuite) TestListNodeSelectorsGroupsBySpiffeID() {
 	dstest.TestListNodeSelectorsGroupsBySpiffeID(s.T(), s.ds, insertRaw)
 }
 
-*/
-
 func (s *PluginSuite) TestDeleteFederationRelationship() {
 	dstest.TestDeleteFederationRelationship(s.T(), s.ds)
 }
-
-/* TODO:
 
 func (s *PluginSuite) TestRegistrationEntriesFederatesWithAgainstMissingBundle() {
 	dstest.TestRegistrationEntriesFederatesWithAgainstMissingBundle(s.T(), s.ds, s.cert)
@@ -451,5 +446,16 @@ func (s *PluginSuite) TestDeleteBundleDissociateRegistrationEntries() {
 	dstest.TestDeleteBundleDissociateRegistrationEntries(s.T(), s.ds, s.cert)
 }
 
+// WIP
+func (s *PluginSuite) TestPruneRegistrationEntryEvents() {
+	newDS := func() (datastore.DataStore, func()) {
+		s.truncateAllTables()
+		return s.ds, func() {}
+	}
 
-*/
+	ds, cleanup := newDS()
+	defer cleanup()
+
+	// Run the migrated test against a fresh datastore so EventIDs start at 1
+	dstest.TestPruneRegistrationEntryEvents(s.T(), ds)
+}
