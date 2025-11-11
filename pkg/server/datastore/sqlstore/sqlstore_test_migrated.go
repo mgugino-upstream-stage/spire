@@ -1,8 +1,12 @@
 package sqlstore
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/spiffe/spire/pkg/server/datastore"
 	dstest "github.com/spiffe/spire/pkg/server/datastore/test"
+	"google.golang.org/grpc/codes"
 )
 
 func (s *PluginSuite) TestBundleCRUD() {
@@ -166,6 +170,72 @@ func (s *PluginSuite) TestDeleteFederationRelationship() {
 }
 
 // Having replicated yet
+
+func (s *PluginSuite) TestListRegistrationEntriesWhenCruftRowsExist() {
+	ctx := context.Background()
+
+	// Wrap into shared helper; rawDeleteBaseAll reproduces the original direct DELETE:
+	rawDeleteBaseAll := func() error {
+		// This matches your original direct exec against "registered_entries".
+		// We preserve the rows-affected check by converting it into an error on mismatch.
+		res, err := s.ds.db.raw.Exec("DELETE FROM registered_entries")
+		if err != nil {
+			return err
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected != 1 {
+			return fmt.Errorf("expected to delete 1 row from registered_entries, deleted %d", rowsAffected)
+		}
+		return nil
+	}
+
+	// Seed + verify via shared test (keeps business logic identical)
+	dstest.TestListRegistrationEntriesWhenCruftRowsExist(s.T(), s.ds, rawDeleteBaseAll)
+
+	// No extra assertions needed; the shared test performs the final list check:
+	// resp, err := s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{})
+	// s.Require().NoError(err)
+	// s.Require().Empty(resp.Entries)
+	_ = ctx // preserve original local variable; avoid unused warning if build tags differ
+}
+
+func (s *PluginSuite) TestListRegistrationEntries() {
+	// Connection is never used, each test creates new connection to a different database
+	s.ds.Close()
+
+	// Delegate to shared dstest implementation which accepts a newDS factory
+	dstest.TestListRegistrationEntries(s.T(), func() datastore.DataStore { return s.newPlugin() }, s.cert, s.cacert)
+
+	resp, err := s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+		Pagination: &datastore.Pagination{
+			PageSize: 0,
+		},
+	})
+	s.RequireGRPCStatus(err, codes.InvalidArgument, "cannot paginate with pagesize = 0")
+	s.Require().Nil(resp)
+
+	resp, err = s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+		Pagination: &datastore.Pagination{
+			Token:    "invalid int",
+			PageSize: 10,
+		},
+	})
+	s.Require().Error(err, "could not parse token 'invalid int'")
+	s.Require().Nil(resp)
+
+	resp, err = s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+		BySelectors: &datastore.BySelectors{},
+	})
+	s.RequireGRPCStatus(err, codes.InvalidArgument, "cannot list by empty selector set")
+	s.Require().Nil(resp)
+}
+
+func (s *PluginSuite) TestFetchInexistentRegistrationEntry() {
+	dstest.TestFetchInexistentRegistrationEntry(s.T(), s.ds)
+}
 
 func (s *PluginSuite) TestRegistrationEntriesFederatesWithAgainstMissingBundle() {
 	dstest.TestRegistrationEntriesFederatesWithAgainstMissingBundle(s.T(), s.ds, s.cert)

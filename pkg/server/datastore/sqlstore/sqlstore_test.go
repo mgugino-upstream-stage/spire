@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,8 +31,6 @@ import (
 	testutil "github.com/spiffe/spire/test/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -353,514 +350,44 @@ func (s *PluginSuite) TestPruneRegistrationEntries() {
 	}
 }
 
-func (s *PluginSuite) TestFetchInexistentRegistrationEntry() {
-	fetchedRegistrationEntry, err := s.ds.FetchRegistrationEntry(ctx, "INEXISTENT")
-	s.Require().NoError(err)
-	s.Require().Nil(fetchedRegistrationEntry)
-}
-
-func (s *PluginSuite) TestListRegistrationEntries() {
-	// Connection is never used, each test creates new connection to a different database
-	s.ds.Close()
-
-	// Delegate to shared dstest implementation which accepts a newDS factory
-	dstest.TestListRegistrationEntries(s.T(), func() datastore.DataStore { return s.newPlugin() }, s.cert, s.cacert)
-
-	resp, err := s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
-		Pagination: &datastore.Pagination{
-			PageSize: 0,
-		},
-	})
-	s.RequireGRPCStatus(err, codes.InvalidArgument, "cannot paginate with pagesize = 0")
-	s.Require().Nil(resp)
-
-	resp, err = s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
-		Pagination: &datastore.Pagination{
-			Token:    "invalid int",
-			PageSize: 10,
-		},
-	})
-	s.Require().Error(err, "could not parse token 'invalid int'")
-	s.Require().Nil(resp)
-
-	resp, err = s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
-		BySelectors: &datastore.BySelectors{},
-	})
-	s.RequireGRPCStatus(err, codes.InvalidArgument, "cannot list by empty selector set")
-	s.Require().Nil(resp)
-}
-
-func (s *PluginSuite) TestListRegistrationEntriesWhenCruftRowsExist() {
-	_, err := s.ds.CreateRegistrationEntry(ctx, &common.RegistrationEntry{
-		Selectors: []*common.Selector{
-			{Type: "TYPE", Value: "VALUE"},
-		},
-		SpiffeId: "SpiffeId",
-		ParentId: "ParentId",
-		DnsNames: []string{
-			"abcd.efg",
-			"somehost",
-		},
-	})
-	s.Require().NoError(err)
-
-	// This is gross. Since the bug that left selectors around has been fixed
-	// (#1191), I'm not sure how else to test this other than just sneaking in
-	// there and removing the registered_entries row.
-	res, err := s.ds.db.raw.Exec("DELETE FROM registered_entries")
-	s.Require().NoError(err)
-	rowsAffected, err := res.RowsAffected()
-	s.Require().NoError(err)
-	s.Require().Equal(int64(1), rowsAffected)
-
-	// Assert that no rows are returned.
-	resp, err := s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{})
-	s.Require().NoError(err)
-	s.Require().Empty(resp.Entries)
-}
-
 func (s *PluginSuite) TestUpdateRegistrationEntry() {
-	entry := s.createRegistrationEntry(&common.RegistrationEntry{
-		Selectors: []*common.Selector{
-			{Type: "Type1", Value: "Value1"},
-			{Type: "Type2", Value: "Value2"},
-			{Type: "Type3", Value: "Value3"},
-		},
-		SpiffeId:    "spiffe://example.org/foo",
-		ParentId:    "spiffe://example.org/bar",
-		X509SvidTtl: 1,
-		JwtSvidTtl:  20,
-	})
-
-	entry.X509SvidTtl = 11
-	entry.JwtSvidTtl = 21
-	entry.Admin = true
-	entry.Downstream = true
-	entry.Hint = "internal"
-
-	updatedRegistrationEntry, err := s.ds.UpdateRegistrationEntry(ctx, entry, nil)
-	s.Require().NoError(err)
-	// Verify output has expected values
-	s.Require().Equal(int32(11), updatedRegistrationEntry.X509SvidTtl)
-	s.Require().Equal(int32(21), updatedRegistrationEntry.JwtSvidTtl)
-	s.Require().True(updatedRegistrationEntry.Admin)
-	s.Require().True(updatedRegistrationEntry.Downstream)
-	s.Require().Equal("internal", updatedRegistrationEntry.Hint)
-	s.Require().Equal(entry.CreatedAt, updatedRegistrationEntry.CreatedAt)
-
-	registrationEntry, err := s.ds.FetchRegistrationEntry(ctx, entry.EntryId)
-	s.Require().NoError(err)
-	s.Require().NotNil(registrationEntry)
-	s.RequireProtoEqual(updatedRegistrationEntry, registrationEntry)
-
-	entry.EntryId = "badid"
-	_, err = s.ds.UpdateRegistrationEntry(ctx, entry, nil)
-	s.RequireGRPCStatus(err, codes.NotFound, _notFoundErrMsg)
+	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
+		s.Require().NoError(err)
+		return out
+	}
+	dstest.TestUpdateRegistrationEntry(s.T(), s.ds, create)
 }
 
 func (s *PluginSuite) TestUpdateRegistrationEntryWithStoreSvid() {
-	entry := s.createRegistrationEntry(&common.RegistrationEntry{
-		Selectors: []*common.Selector{
-			{Type: "Type1", Value: "Value1"},
-			{Type: "Type1", Value: "Value2"},
-			{Type: "Type1", Value: "Value3"},
-		},
-		SpiffeId:    "spiffe://example.org/foo",
-		ParentId:    "spiffe://example.org/bar",
-		X509SvidTtl: 1,
-	})
-
-	entry.StoreSvid = true
-
-	updateRegistrationEntry, err := s.ds.UpdateRegistrationEntry(ctx, entry, nil)
-	s.Require().NoError(err)
-	s.Require().NotNil(updateRegistrationEntry)
-	// Verify output has expected values
-	s.Require().True(entry.StoreSvid)
-
-	fetchRegistrationEntry, err := s.ds.FetchRegistrationEntry(ctx, entry.EntryId)
-	s.Require().NoError(err)
-	s.RequireProtoEqual(updateRegistrationEntry, fetchRegistrationEntry)
-
-	// Update with invalid selectors
-	entry.Selectors = []*common.Selector{
-		{Type: "Type1", Value: "Value1"},
-		{Type: "Type1", Value: "Value2"},
-		{Type: "Type2", Value: "Value3"},
+	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
+		s.Require().NoError(err)
+		return out
 	}
-	resp, err := s.ds.UpdateRegistrationEntry(ctx, entry, nil)
-	s.Require().Nil(resp)
-	s.Require().EqualError(err, "rpc error: code = InvalidArgument desc = datastore-validation: invalid registration entry: selector types must be the same when store SVID is enabled")
+	dstest.TestUpdateRegistrationEntryWithStoreSvid(s.T(), s.ds, create)
 }
 
 func (s *PluginSuite) TestUpdateRegistrationEntryWithMask() {
-	// There are 11 fields in a registration entry. Of these, 5 have some validation in the SQL
-	// layer. In this test, we update each of the 11 fields and make sure update works, and also check
-	// with the mask value false to make sure nothing changes. For the 5 fields that have validation
-	// we try with good data, bad data, and with or without a mask (so 4 cases each.)
-
-	// Note that most of the input validation is done in the API layer and has more extensive tests there.
-	now := time.Now().Unix()
-	oldEntry := &common.RegistrationEntry{
-		ParentId:      "spiffe://example.org/oldParentId",
-		SpiffeId:      "spiffe://example.org/oldSpiffeId",
-		X509SvidTtl:   1000,
-		JwtSvidTtl:    3000,
-		Selectors:     []*common.Selector{{Type: "Type1", Value: "Value1"}},
-		FederatesWith: []string{"spiffe://dom1.org"},
-		Admin:         false,
-		EntryExpiry:   1000,
-		DnsNames:      []string{"dns1"},
-		Downstream:    false,
-		StoreSvid:     false,
-	}
-	newEntry := &common.RegistrationEntry{
-		ParentId:      "spiffe://example.org/oldParentId",
-		SpiffeId:      "spiffe://example.org/newSpiffeId",
-		X509SvidTtl:   4000,
-		JwtSvidTtl:    6000,
-		Selectors:     []*common.Selector{{Type: "Type2", Value: "Value2"}},
-		FederatesWith: []string{"spiffe://dom2.org"},
-		Admin:         false,
-		EntryExpiry:   1000,
-		DnsNames:      []string{"dns2"},
-		Downstream:    false,
-		StoreSvid:     true,
-		Hint:          "internal",
-	}
-	badEntry := &common.RegistrationEntry{
-		ParentId:      "not a good parent id",
-		SpiffeId:      "",
-		X509SvidTtl:   -1000,
-		JwtSvidTtl:    -3000,
-		Selectors:     []*common.Selector{},
-		FederatesWith: []string{"invalid federated bundle"},
-		Admin:         false,
-		EntryExpiry:   -2000,
-		DnsNames:      []string{"this is a bad domain name "},
-		Downstream:    false,
-	}
-	// Needed for the FederatesWith field to work
-	s.createBundle("spiffe://dom1.org")
-	s.createBundle("spiffe://dom2.org")
-
-	var id string
-	for _, testcase := range []struct {
-		name   string
-		mask   *common.RegistrationEntryMask
-		update func(*common.RegistrationEntry)
-		result func(*common.RegistrationEntry)
-		err    error
-	}{ // SPIFFE ID FIELD -- this field is validated so we check with good and bad data
-		{
-			name:   "Update Spiffe ID, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{SpiffeId: true},
-			update: func(e *common.RegistrationEntry) { e.SpiffeId = newEntry.SpiffeId },
-			result: func(e *common.RegistrationEntry) { e.SpiffeId = newEntry.SpiffeId },
+	dstest.TestUpdateRegistrationEntryWithMask(
+		s.T(),
+		s.ds,
+		func(td string) { s.createBundle(td) },
+		func(t *testing.T, ds datastore.DataStore, entry *common.RegistrationEntry) *common.RegistrationEntry {
+			return dstest.CreateRegistrationEntry(t, ds, entry)
 		},
-		{
-			name:   "Update Spiffe ID, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{SpiffeId: false},
-			update: func(e *common.RegistrationEntry) { e.SpiffeId = newEntry.SpiffeId },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		{
-			name:   "Update Spiffe ID, Bad Data, Mask True",
-			mask:   &common.RegistrationEntryMask{SpiffeId: true},
-			update: func(e *common.RegistrationEntry) { e.SpiffeId = badEntry.SpiffeId },
-			err:    errors.New("invalid registration entry: missing SPIFFE ID"),
-		},
-		{
-			name:   "Update Spiffe ID, Bad Data, Mask False",
-			mask:   &common.RegistrationEntryMask{SpiffeId: false},
-			update: func(e *common.RegistrationEntry) { e.SpiffeId = badEntry.SpiffeId },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// PARENT ID FIELD -- This field isn't validated so we just check with good data
-		{
-			name:   "Update Parent ID, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{ParentId: true},
-			update: func(e *common.RegistrationEntry) { e.ParentId = newEntry.ParentId },
-			result: func(e *common.RegistrationEntry) { e.ParentId = newEntry.ParentId },
-		},
-		{
-			name:   "Update Parent ID, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{ParentId: false},
-			update: func(e *common.RegistrationEntry) { e.ParentId = newEntry.ParentId },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// X509 SVID TTL FIELD -- This field is validated so we check with good and bad data
-		{
-			name:   "Update X509 SVID TTL, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{X509SvidTtl: true},
-			update: func(e *common.RegistrationEntry) { e.X509SvidTtl = newEntry.X509SvidTtl },
-			result: func(e *common.RegistrationEntry) { e.X509SvidTtl = newEntry.X509SvidTtl },
-		},
-		{
-			name:   "Update X509 SVID TTL, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{X509SvidTtl: false},
-			update: func(e *common.RegistrationEntry) { e.X509SvidTtl = badEntry.X509SvidTtl },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		{
-			name:   "Update X509 SVID TTL, Bad Data, Mask True",
-			mask:   &common.RegistrationEntryMask{X509SvidTtl: true},
-			update: func(e *common.RegistrationEntry) { e.X509SvidTtl = badEntry.X509SvidTtl },
-			err:    errors.New("invalid registration entry: X509SvidTtl is not set"),
-		},
-		{
-			name:   "Update X509 SVID TTL, Bad Data, Mask False",
-			mask:   &common.RegistrationEntryMask{X509SvidTtl: false},
-			update: func(e *common.RegistrationEntry) { e.X509SvidTtl = badEntry.X509SvidTtl },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// JWT SVID TTL FIELD -- This field is validated so we check with good and bad data
-		{
-			name:   "Update JWT SVID TTL, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{JwtSvidTtl: true},
-			update: func(e *common.RegistrationEntry) { e.JwtSvidTtl = newEntry.JwtSvidTtl },
-			result: func(e *common.RegistrationEntry) { e.JwtSvidTtl = newEntry.JwtSvidTtl },
-		},
-		{
-			name:   "Update JWT SVID TTL, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{JwtSvidTtl: false},
-			update: func(e *common.RegistrationEntry) { e.JwtSvidTtl = badEntry.JwtSvidTtl },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		{
-			name:   "Update JWT SVID TTL, Bad Data, Mask True",
-			mask:   &common.RegistrationEntryMask{JwtSvidTtl: true},
-			update: func(e *common.RegistrationEntry) { e.JwtSvidTtl = badEntry.JwtSvidTtl },
-			err:    errors.New("invalid registration entry: JwtSvidTtl is not set"),
-		},
-		{
-			name:   "Update JWT SVID TTL, Bad Data, Mask False",
-			mask:   &common.RegistrationEntryMask{JwtSvidTtl: false},
-			update: func(e *common.RegistrationEntry) { e.JwtSvidTtl = badEntry.JwtSvidTtl },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// SELECTORS FIELD -- This field is validated so we check with good and bad data
-		{
-			name:   "Update Selectors, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{Selectors: true},
-			update: func(e *common.RegistrationEntry) { e.Selectors = newEntry.Selectors },
-			result: func(e *common.RegistrationEntry) { e.Selectors = newEntry.Selectors },
-		},
-		{
-			name:   "Update Selectors, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{Selectors: false},
-			update: func(e *common.RegistrationEntry) { e.Selectors = badEntry.Selectors },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		{
-			name:   "Update Selectors, Bad Data, Mask True",
-			mask:   &common.RegistrationEntryMask{Selectors: true},
-			update: func(e *common.RegistrationEntry) { e.Selectors = badEntry.Selectors },
-			err:    errors.New("invalid registration entry: missing selector list"),
-		},
-		{
-			name:   "Update Selectors, Bad Data, Mask False",
-			mask:   &common.RegistrationEntryMask{Selectors: false},
-			update: func(e *common.RegistrationEntry) { e.Selectors = badEntry.Selectors },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// FEDERATESWITH FIELD -- This field isn't validated so we just check with good data
-		{
-			name:   "Update FederatesWith, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{FederatesWith: true},
-			update: func(e *common.RegistrationEntry) { e.FederatesWith = newEntry.FederatesWith },
-			result: func(e *common.RegistrationEntry) { e.FederatesWith = newEntry.FederatesWith },
-		},
-		{
-			name:   "Update FederatesWith Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{FederatesWith: false},
-			update: func(e *common.RegistrationEntry) { e.FederatesWith = newEntry.FederatesWith },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// ADMIN FIELD -- This field isn't validated so we just check with good data
-		{
-			name:   "Update Admin, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{Admin: true},
-			update: func(e *common.RegistrationEntry) { e.Admin = newEntry.Admin },
-			result: func(e *common.RegistrationEntry) { e.Admin = newEntry.Admin },
-		},
-		{
-			name:   "Update Admin, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{Admin: false},
-			update: func(e *common.RegistrationEntry) { e.Admin = newEntry.Admin },
-			result: func(e *common.RegistrationEntry) {},
-		},
-
-		// STORESVID FIELD -- This field isn't validated so we just check with good data
-		{
-			name:   "Update StoreSvid, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{StoreSvid: true},
-			update: func(e *common.RegistrationEntry) { e.StoreSvid = newEntry.StoreSvid },
-			result: func(e *common.RegistrationEntry) { e.StoreSvid = newEntry.StoreSvid },
-		},
-		{
-			name:   "Update StoreSvid, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{Admin: false},
-			update: func(e *common.RegistrationEntry) { e.StoreSvid = newEntry.StoreSvid },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		{
-			name: "Update StoreSvid, Invalid selectors, Mask True",
-			mask: &common.RegistrationEntryMask{StoreSvid: true, Selectors: true},
-			update: func(e *common.RegistrationEntry) {
-				e.StoreSvid = newEntry.StoreSvid
-				e.Selectors = []*common.Selector{
-					{Type: "Type1", Value: "Value1"},
-					{Type: "Type2", Value: "Value2"},
-				}
-			},
-			err: newValidationError("invalid registration entry: selector types must be the same when store SVID is enabled"),
-		},
-
-		// ENTRYEXPIRY FIELD -- This field isn't validated so we just check with good data
-		{
-			name:   "Update EntryExpiry, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{EntryExpiry: true},
-			update: func(e *common.RegistrationEntry) { e.EntryExpiry = newEntry.EntryExpiry },
-			result: func(e *common.RegistrationEntry) { e.EntryExpiry = newEntry.EntryExpiry },
-		},
-		{
-			name:   "Update EntryExpiry, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{EntryExpiry: false},
-			update: func(e *common.RegistrationEntry) { e.EntryExpiry = newEntry.EntryExpiry },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// DNSNAMES FIELD -- This field isn't validated so we just check with good data
-		{
-			name:   "Update DnsNames, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{DnsNames: true},
-			update: func(e *common.RegistrationEntry) { e.DnsNames = newEntry.DnsNames },
-			result: func(e *common.RegistrationEntry) { e.DnsNames = newEntry.DnsNames },
-		},
-		{
-			name:   "Update DnsNames, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{DnsNames: false},
-			update: func(e *common.RegistrationEntry) { e.DnsNames = newEntry.DnsNames },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// DOWNSTREAM FIELD -- This field isn't validated so we just check with good data
-		{
-			name:   "Update DnsNames, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{Downstream: true},
-			update: func(e *common.RegistrationEntry) { e.Downstream = newEntry.Downstream },
-			result: func(e *common.RegistrationEntry) { e.Downstream = newEntry.Downstream },
-		},
-		{
-			name:   "Update DnsNames, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{Downstream: false},
-			update: func(e *common.RegistrationEntry) { e.Downstream = newEntry.Downstream },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// HINT -- This field isn't validated so we just check with good data
-		{
-			name:   "Update Hint, Good Data, Mask True",
-			mask:   &common.RegistrationEntryMask{Hint: true},
-			update: func(e *common.RegistrationEntry) { e.Hint = newEntry.Hint },
-			result: func(e *common.RegistrationEntry) { e.Hint = newEntry.Hint },
-		},
-		{
-			name:   "Update Hint, Good Data, Mask False",
-			mask:   &common.RegistrationEntryMask{Hint: false},
-			update: func(e *common.RegistrationEntry) { e.Hint = newEntry.Hint },
-			result: func(e *common.RegistrationEntry) {},
-		},
-		// This should update all fields
-		{
-			name:   "Test With Nil Mask",
-			mask:   nil,
-			update: func(e *common.RegistrationEntry) { proto.Merge(e, oldEntry) },
-			result: func(e *common.RegistrationEntry) {},
-		},
-	} {
-		tt := testcase
-		s.Run(tt.name, func() {
-			if id != "" {
-				s.deleteRegistrationEntry(id)
-			}
-			registrationEntry := s.createRegistrationEntry(oldEntry)
-			id = registrationEntry.EntryId
-
-			updateEntry := &common.RegistrationEntry{}
-			tt.update(updateEntry)
-			updateEntry.EntryId = id
-			updatedRegistrationEntry, err := s.ds.UpdateRegistrationEntry(ctx, updateEntry, tt.mask)
-
-			if tt.err != nil {
-				s.Require().ErrorContains(err, tt.err.Error())
-				return
-			}
-
-			s.Require().NoError(err)
-			expectedResult := proto.Clone(oldEntry).(*common.RegistrationEntry)
-			tt.result(expectedResult)
-			expectedResult.EntryId = id
-			expectedResult.RevisionNumber++
-			s.assertCreatedAtField(updatedRegistrationEntry, now)
-			s.RequireProtoEqual(expectedResult, updatedRegistrationEntry)
-
-			// Fetch and check the results match expectations
-			registrationEntry, err = s.ds.FetchRegistrationEntry(ctx, id)
-			s.Require().NoError(err)
-			s.Require().NotNil(registrationEntry)
-
-			s.assertCreatedAtField(registrationEntry, now)
-
-			s.RequireProtoEqual(expectedResult, registrationEntry)
-		})
-	}
+		s.deleteRegistrationEntry,
+		s.assertCreatedAtField,
+	)
 }
 
 func (s *PluginSuite) TestDeleteRegistrationEntry() {
-	// delete non-existing
-	_, err := s.ds.DeleteRegistrationEntry(ctx, "badid")
-	s.RequireGRPCStatus(err, codes.NotFound, _notFoundErrMsg)
-
-	entry1 := s.createRegistrationEntry(&common.RegistrationEntry{
-		Selectors: []*common.Selector{
-			{Type: "Type1", Value: "Value1"},
-			{Type: "Type2", Value: "Value2"},
-			{Type: "Type3", Value: "Value3"},
-		},
-		SpiffeId:    "spiffe://example.org/foo",
-		ParentId:    "spiffe://example.org/bar",
-		X509SvidTtl: 1,
-	})
-
-	s.createRegistrationEntry(&common.RegistrationEntry{
-		Selectors: []*common.Selector{
-			{Type: "Type3", Value: "Value3"},
-			{Type: "Type4", Value: "Value4"},
-			{Type: "Type5", Value: "Value5"},
-		},
-		SpiffeId:    "spiffe://example.org/baz",
-		ParentId:    "spiffe://example.org/bat",
-		X509SvidTtl: 2,
-	})
-
-	// We have two registration entries
-	entriesResp, err := s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{})
-	s.Require().NoError(err)
-	s.Require().Len(entriesResp.Entries, 2)
-
-	// Make sure we deleted the right one
-	deletedEntry, err := s.ds.DeleteRegistrationEntry(ctx, entry1.EntryId)
-	s.Require().NoError(err)
-	s.Require().Equal(entry1, deletedEntry)
-
-	// Make sure we have now only one registration entry
-	entriesResp, err = s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{})
-	s.Require().NoError(err)
-	s.Require().Len(entriesResp.Entries, 1)
-
-	// Delete again must fails with Not Found
-	deletedEntry, err = s.ds.DeleteRegistrationEntry(ctx, entry1.EntryId)
-	s.Require().EqualError(err, "rpc error: code = NotFound desc = datastore-sql: record not found")
-	s.Require().Nil(deletedEntry)
+	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
+		s.Require().NoError(err)
+		return out
+	}
+	dstest.TestDeleteRegistrationEntry(s.T(), s.ds, create)
 }
 
 func (s *PluginSuite) TestListParentIDEntries() {

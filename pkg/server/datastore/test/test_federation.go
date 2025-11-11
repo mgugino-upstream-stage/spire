@@ -31,7 +31,7 @@ func TestRegistrationEntriesFederatesWithSuccess(t *testing.T, ds datastore.Data
 	createBundle(t, ds, "spiffe://otherdomain.org", cert)
 	createBundle(t, ds, "spiffe://otherdomain2.org", cert)
 
-	expected := createRegistrationEntry(t, ds, makeFederatedRegistrationEntry())
+	expected := CreateRegistrationEntry(t, ds, makeFederatedRegistrationEntry())
 	// fetch the entry and make sure the federated trust ids come back
 	actual := fetchRegistrationEntry(t, ds, expected.EntryId)
 	spiretest.AssertProtoEqual(t, expected, actual)
@@ -41,7 +41,7 @@ func TestRegistrationEntriesFederatesWithSuccess(t *testing.T, ds datastore.Data
 func TestDeleteBundleRestrictedByRegistrationEntries(t *testing.T, ds datastore.DataStore, cert *x509.Certificate) {
 	// create the bundle and associated entry
 	createBundle(t, ds, "spiffe://otherdomain.org", cert)
-	createRegistrationEntry(t, ds, makeFederatedRegistrationEntry())
+	CreateRegistrationEntry(t, ds, makeFederatedRegistrationEntry())
 
 	// delete the bundle in RESTRICTED mode
 	err := ds.DeleteBundle(context.Background(), "spiffe://otherdomain.org", datastore.Restrict)
@@ -52,14 +52,14 @@ func TestDeleteBundleRestrictedByRegistrationEntries(t *testing.T, ds datastore.
 func TestDeleteBundleDeleteRegistrationEntries(t *testing.T, ds datastore.DataStore, cert *x509.Certificate) {
 	// create an unrelated registration entry to make sure the delete
 	// operation only deletes associated registration entries.
-	unrelated := createRegistrationEntry(t, ds, &common.RegistrationEntry{
+	unrelated := CreateRegistrationEntry(t, ds, &common.RegistrationEntry{
 		SpiffeId:  "spiffe://example.org/foo",
 		Selectors: []*common.Selector{{Type: "TYPE", Value: "VALUE"}},
 	})
 
 	// create the bundle and associated entry
 	createBundle(t, ds, "spiffe://otherdomain.org", cert)
-	entry := createRegistrationEntry(t, ds, makeFederatedRegistrationEntry())
+	entry := CreateRegistrationEntry(t, ds, makeFederatedRegistrationEntry())
 
 	// delete the bundle in Delete mode
 	err := ds.DeleteBundle(context.Background(), "spiffe://otherdomain.org", datastore.Delete)
@@ -78,7 +78,7 @@ func TestDeleteBundleDeleteRegistrationEntries(t *testing.T, ds datastore.DataSt
 func TestDeleteBundleDissociateRegistrationEntries(t *testing.T, ds datastore.DataStore, cert *x509.Certificate) {
 	// create the bundle and associated entry
 	createBundle(t, ds, "spiffe://otherdomain.org", cert)
-	entry := createRegistrationEntry(t, ds, makeFederatedRegistrationEntry())
+	entry := CreateRegistrationEntry(t, ds, makeFederatedRegistrationEntry())
 
 	// delete the bundle in DISSOCIATE mode
 	err := ds.DeleteBundle(context.Background(), "spiffe://otherdomain.org", datastore.Dissociate)

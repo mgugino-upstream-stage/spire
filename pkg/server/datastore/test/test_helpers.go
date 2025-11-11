@@ -63,7 +63,7 @@ func makeFederatedRegistrationEntry() *common.RegistrationEntry {
 }
 
 // createRegistrationEntry helper for the test package
-func createRegistrationEntry(t *testing.T, ds datastore.DataStore, entry *common.RegistrationEntry) *common.RegistrationEntry {
+func CreateRegistrationEntry(t *testing.T, ds datastore.DataStore, entry *common.RegistrationEntry) *common.RegistrationEntry {
 	registrationEntry, err := ds.CreateRegistrationEntry(ctx, entry)
 	require.NoError(t, err)
 	require.NotNil(t, registrationEntry)

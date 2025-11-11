@@ -75,7 +75,7 @@ func newWrappedDSError(err error) error {
 	}
 }
 
-func newValidationError(fmtMsg string, args ...any) error {
+func NewValidationError(fmtMsg string, args ...any) error {
 	return &validationError{
 		msg: fmt.Sprintf(fmtMsg, args...),
 	}

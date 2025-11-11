@@ -200,7 +200,7 @@ func TestListRegistrationEntries(t *testing.T, newDS func() datastore.DataStore,
 
 					entryIDMap := map[string]string{}
 					for _, entryIn := range tt.entries {
-						entryOut := createRegistrationEntry(t, ds, entryIn)
+						entryOut := CreateRegistrationEntry(t, ds, entryIn)
 						entryIDMap[entryOut.EntryId] = entryIn.EntryId
 					}
 
