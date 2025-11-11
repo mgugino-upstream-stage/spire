@@ -379,6 +379,12 @@ func (s *PluginSuite) TestPruneRegistrationEntries() {
 	)
 }
 
+func (s *PluginSuite) TestCountRegistrationEntries() {
+	dstest.TestCountRegistrationEntries(s.T(), s.ds)
+}
+
+// WIP, migrate the rest below
+
 func (s *PluginSuite) TestUpdateRegistrationEntry() {
 	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
 		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
@@ -527,8 +533,4 @@ func (s *PluginSuite) TestFetchRegistrationEntryDoesNotExist() {
 
 func (s *PluginSuite) TestFetchRegistrationEntries() {
 	dstest.TestFetchRegistrationEntries(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestCountRegistrationEntries() {
-	dstest.TestCountRegistrationEntries(s.T(), s.ds)
 }
