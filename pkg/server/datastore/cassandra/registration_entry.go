@@ -306,7 +306,7 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 		}
 	}
 
-	// We’ll gather a set of entry_ids to restrict the main query.
+	// We’ll build a list of entry_ids to restrict the main query.
 	var restrictToEntryIDs []string
 	keys := func(m map[string]struct{}) []string {
 		out := make([]string, 0, len(m))
@@ -316,13 +316,17 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 		return out
 	}
 
-	// ----- Selector filtering (MatchAny = union) -----
+	// =========================
+	// BySelectors filter block
+	// =========================
 	var selectorIDSet map[string]struct{}
 	if req != nil && req.BySelectors != nil && len(req.BySelectors.Selectors) > 0 {
+		const selQ = `SELECT entry_id FROM selectors WHERE selector_type = ? AND selector_value = ? ALLOW FILTERING`
+
 		switch req.BySelectors.Match {
 		case datastore.MatchAny:
-			ids := make(map[string]struct{})
-			const selQ = `SELECT entry_id FROM selectors WHERE selector_type = ? AND selector_value = ? ALLOW FILTERING`
+			// union of entry_ids that have ANY of the selectors
+			union := make(map[string]struct{})
 			for _, s := range req.BySelectors.Selectors {
 				if s == nil {
 					continue
@@ -330,30 +334,180 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 				iter := ds.session.Query(selQ, s.Type, s.Value).Iter()
 				var id string
 				for iter.Scan(&id) {
-					ids[id] = struct{}{}
+					union[id] = struct{}{}
 				}
 				if err := iter.Close(); err != nil {
 					return nil, newError("failed to query selectors: %v", err)
 				}
 			}
-			if len(ids) == 0 {
-				return resp, nil // no matches
+			if len(union) == 0 {
+				return resp, nil
 			}
-			selectorIDSet = ids
+			selectorIDSet = union
+
+		case datastore.Superset:
+			// intersection: entries must contain ALL requested selectors (extras allowed)
+			var inter map[string]struct{}
+			for i, s := range req.BySelectors.Selectors {
+				if s == nil {
+					continue
+				}
+				iter := ds.session.Query(selQ, s.Type, s.Value).Iter()
+				cur := make(map[string]struct{})
+				var id string
+				for iter.Scan(&id) {
+					cur[id] = struct{}{}
+				}
+				if err := iter.Close(); err != nil {
+					return nil, newError("failed to query selectors: %v", err)
+				}
+				if i == 0 || inter == nil {
+					inter = cur
+				} else {
+					for k := range inter {
+						if _, ok := cur[k]; !ok {
+							delete(inter, k)
+						}
+					}
+				}
+				if len(inter) == 0 {
+					return resp, nil
+				}
+			}
+			selectorIDSet = inter
+
+		case datastore.Subset:
+			// entries whose selector set is a SUBSET of the requested set
+			// approach: union candidates, then verify each candidate's full selector set ⊆ requested
+			reqSet := make(map[string]struct{}, len(req.BySelectors.Selectors))
+			for _, s := range req.BySelectors.Selectors {
+				if s == nil {
+					continue
+				}
+				reqSet[s.Type+"|"+s.Value] = struct{}{}
+			}
+			// union candidates
+			candidates := make(map[string]struct{})
+			for _, s := range req.BySelectors.Selectors {
+				if s == nil {
+					continue
+				}
+				iter := ds.session.Query(selQ, s.Type, s.Value).Iter()
+				var id string
+				for iter.Scan(&id) {
+					candidates[id] = struct{}{}
+				}
+				if err := iter.Close(); err != nil {
+					return nil, newError("failed to query selectors: %v", err)
+				}
+			}
+			if len(candidates) == 0 {
+				return resp, nil
+			}
+
+			// verify subset for each candidate
+			valid := make(map[string]struct{})
+			for id := range candidates {
+				full, err := ds.fetchSelectorsByEntryID(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				ok := true
+				for _, sel := range full {
+					key := sel.Type + "|" + sel.Value
+					if _, in := reqSet[key]; !in {
+						ok = false
+						break
+					}
+				}
+				if ok {
+					valid[id] = struct{}{}
+				}
+			}
+			if len(valid) == 0 {
+				return resp, nil
+			}
+			selectorIDSet = valid
+
+		case datastore.Exact:
+			// entries must contain exactly the requested selectors (no more, no fewer)
+			// start with Superset candidates then size-check
+			var inter map[string]struct{}
+			for i, s := range req.BySelectors.Selectors {
+				if s == nil {
+					continue
+				}
+				iter := ds.session.Query(selQ, s.Type, s.Value).Iter()
+				cur := make(map[string]struct{})
+				var id string
+				for iter.Scan(&id) {
+					cur[id] = struct{}{}
+				}
+				if err := iter.Close(); err != nil {
+					return nil, newError("failed to query selectors: %v", err)
+				}
+				if i == 0 || inter == nil {
+					inter = cur
+				} else {
+					for k := range inter {
+						if _, ok := cur[k]; !ok {
+							delete(inter, k)
+						}
+					}
+				}
+				if len(inter) == 0 {
+					return resp, nil
+				}
+			}
+			// verify equality
+			want := make(map[string]struct{}, len(req.BySelectors.Selectors))
+			for _, s := range req.BySelectors.Selectors {
+				if s == nil {
+					continue
+				}
+				want[s.Type+"|"+s.Value] = struct{}{}
+			}
+			exact := make(map[string]struct{})
+			for id := range inter {
+				full, err := ds.fetchSelectorsByEntryID(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				if len(full) != len(want) {
+					continue
+				}
+				match := true
+				for _, sel := range full {
+					if _, ok := want[sel.Type+"|"+sel.Value]; !ok {
+						match = false
+						break
+					}
+				}
+				if match {
+					exact[id] = struct{}{}
+				}
+			}
+			if len(exact) == 0 {
+				return resp, nil
+			}
+			selectorIDSet = exact
+
 		default:
-			// Other selector modes not needed for these tests.
+			// Unknown match mode -> empty
 			return resp, nil
 		}
 	}
 
-	// ----- FederatesWith filtering -----
+	// ================================
+	// ByFederatesWith filter block
+	// ================================
 	var fwIDSet map[string]struct{}
 	if req != nil && req.ByFederatesWith != nil && len(req.ByFederatesWith.TrustDomains) > 0 {
 		const fwQ = `SELECT entry_id FROM federates_with WHERE trust_domain = ? ALLOW FILTERING`
 
 		switch req.ByFederatesWith.Match {
 		case datastore.MatchAny:
-			// UNION across trust domains
+			// union across trust domains
 			union := make(map[string]struct{})
 			for _, td := range req.ByFederatesWith.TrustDomains {
 				iter := ds.session.Query(fwQ, td).Iter()
@@ -371,8 +525,8 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 			fwIDSet = union
 
 		case datastore.Superset:
-			// INTERSECTION across trust domains
-			var intersect map[string]struct{}
+			// intersection: entry must contain ALL the requested TDs
+			var inter map[string]struct{}
 			for i, td := range req.ByFederatesWith.TrustDomains {
 				iter := ds.session.Query(fwQ, td).Iter()
 				cur := make(map[string]struct{})
@@ -383,28 +537,129 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 				if err := iter.Close(); err != nil {
 					return nil, newError("failed to query federates_with: %v", err)
 				}
-				if i == 0 {
-					intersect = cur
+				if i == 0 || inter == nil {
+					inter = cur
 				} else {
-					for k := range intersect {
+					for k := range inter {
 						if _, ok := cur[k]; !ok {
-							delete(intersect, k)
+							delete(inter, k)
 						}
 					}
 				}
-				if len(intersect) == 0 {
+				if len(inter) == 0 {
 					return resp, nil
 				}
 			}
-			fwIDSet = intersect
+			fwIDSet = inter
+
+		case datastore.Subset:
+			// entries whose federates_with set is a SUBSET of requested TDs
+			reqSet := make(map[string]struct{}, len(req.ByFederatesWith.TrustDomains))
+			for _, td := range req.ByFederatesWith.TrustDomains {
+				reqSet[td] = struct{}{}
+			}
+
+			// union candidates
+			candidates := make(map[string]struct{})
+			for _, td := range req.ByFederatesWith.TrustDomains {
+				iter := ds.session.Query(fwQ, td).Iter()
+				var id string
+				for iter.Scan(&id) {
+					candidates[id] = struct{}{}
+				}
+				if err := iter.Close(); err != nil {
+					return nil, newError("failed to query federates_with: %v", err)
+				}
+			}
+			if len(candidates) == 0 {
+				return resp, nil
+			}
+
+			// verify subset
+			valid := make(map[string]struct{})
+			for id := range candidates {
+				full, err := ds.fetchFederatesWithByEntryID(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				ok := true
+				for _, td := range full {
+					if _, in := reqSet[td]; !in {
+						ok = false
+						break
+					}
+				}
+				if ok {
+					valid[id] = struct{}{}
+				}
+			}
+			if len(valid) == 0 {
+				return resp, nil
+			}
+			fwIDSet = valid
+
+		case datastore.Exact:
+			// entry TDs must equal requested TDs
+			var inter map[string]struct{}
+			for i, td := range req.ByFederatesWith.TrustDomains {
+				iter := ds.session.Query(fwQ, td).Iter()
+				cur := make(map[string]struct{})
+				var id string
+				for iter.Scan(&id) {
+					cur[id] = struct{}{}
+				}
+				if err := iter.Close(); err != nil {
+					return nil, newError("failed to query federates_with: %v", err)
+				}
+				if i == 0 || inter == nil {
+					inter = cur
+				} else {
+					for k := range inter {
+						if _, ok := cur[k]; !ok {
+							delete(inter, k)
+						}
+					}
+				}
+				if len(inter) == 0 {
+					return resp, nil
+				}
+			}
+			// verify equality
+			want := make(map[string]struct{}, len(req.ByFederatesWith.TrustDomains))
+			for _, td := range req.ByFederatesWith.TrustDomains {
+				want[td] = struct{}{}
+			}
+			exact := make(map[string]struct{})
+			for id := range inter {
+				full, err := ds.fetchFederatesWithByEntryID(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				if len(full) != len(want) {
+					continue
+				}
+				match := true
+				for _, td := range full {
+					if _, ok := want[td]; !ok {
+						match = false
+						break
+					}
+				}
+				if match {
+					exact[id] = struct{}{}
+				}
+			}
+			if len(exact) == 0 {
+				return resp, nil
+			}
+			fwIDSet = exact
 
 		default:
-			// Not needed for these tests
 			return resp, nil
 		}
 	}
 
-	// ----- Compose selector & federates_with filters (AND) -----
+	// ----- Compose selector and federates_with filters -----
 	switch {
 	case selectorIDSet != nil && fwIDSet != nil:
 		combined := make(map[string]struct{})
@@ -417,10 +672,8 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 			return resp, nil
 		}
 		restrictToEntryIDs = keys(combined)
-
 	case selectorIDSet != nil:
 		restrictToEntryIDs = keys(selectorIDSet)
-
 	case fwIDSet != nil:
 		restrictToEntryIDs = keys(fwIDSet)
 	}
@@ -429,8 +682,11 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 	baseQ := `SELECT entry_id, spiffe_id, parent_id, x509_svid_ttl, admin, downstream, expiry, store_svid, hint, jwt_svid_ttl, revision_number, created_at FROM registered_entries`
 	where := []string{}
 	args := []interface{}{}
+	needAllowFiltering := false
 
 	if len(restrictToEntryIDs) > 0 {
+		// We already limited to primary key(s). Do NOT push more WHERE clauses; we'll filter in-memory later.
+		// Trim IN list to pageSize to keep it small (tests are small anyway).
 		if int32(len(restrictToEntryIDs)) > pageSize {
 			restrictToEntryIDs = restrictToEntryIDs[:pageSize]
 		}
@@ -439,22 +695,27 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 			args = append(args, id)
 		}
 	} else {
+		// Apply simple filters that require ALLOW FILTERING on this schema
 		if req != nil {
 			if req.ByParentID != "" {
 				where = append(where, "parent_id = ?")
 				args = append(args, req.ByParentID)
+				needAllowFiltering = true
 			}
 			if req.BySpiffeID != "" {
 				where = append(where, "spiffe_id = ?")
 				args = append(args, req.BySpiffeID)
+				needAllowFiltering = true
 			}
 			if req.ByHint != "" {
 				where = append(where, "hint = ?")
 				args = append(args, req.ByHint)
+				needAllowFiltering = true
 			}
 			if req.ByDownstream != nil {
 				where = append(where, "downstream = ?")
 				args = append(args, *req.ByDownstream)
+				needAllowFiltering = true
 			}
 		}
 	}
@@ -465,6 +726,11 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 	}
 	q += " LIMIT ?"
 	args = append(args, pageSize)
+
+	// IMPORTANT: ALLOW FILTERING must be at the very end
+	if needAllowFiltering {
+		q += " ALLOW FILTERING"
+	}
 
 	cq := ds.session.Query(q, args...)
 	if len(pagingState) > 0 {
@@ -486,7 +752,6 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 		revisionNumber int64
 		createdAt      time.Time
 	)
-
 	type RegEntryModel struct {
 		EntryID        string
 		SpiffeID       string
@@ -501,22 +766,12 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 		RevisionNumber int64
 		CreatedAt      time.Time
 	}
-
 	var models []RegEntryModel
 	for iter.Scan(&entryID, &spiffeID, &parentID, &x509SvidTtl, &admin, &downstream, &expiry, &storeSvid, &hint, &jwtSvidTtl, &revisionNumber, &createdAt) {
 		models = append(models, RegEntryModel{
-			EntryID:        entryID,
-			SpiffeID:       spiffeID,
-			ParentID:       parentID,
-			X509SvidTtl:    x509SvidTtl,
-			Admin:          admin,
-			Downstream:     downstream,
-			Expiry:         expiry,
-			StoreSvid:      storeSvid,
-			Hint:           hint,
-			JwtSvidTtl:     jwtSvidTtl,
-			RevisionNumber: revisionNumber,
-			CreatedAt:      createdAt,
+			EntryID: entryID, SpiffeID: spiffeID, ParentID: parentID, X509SvidTtl: x509SvidTtl,
+			Admin: admin, Downstream: downstream, Expiry: expiry, StoreSvid: storeSvid, Hint: hint,
+			JwtSvidTtl: jwtSvidTtl, RevisionNumber: revisionNumber, CreatedAt: createdAt,
 		})
 	}
 	if err := iter.Close(); err != nil {
@@ -524,7 +779,7 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 	}
 	nextPagingState := iter.PageState()
 
-	// Apply simple filters in-memory if we used IN(...)
+	// If we used IN(...) and also had simple filters, apply them in-memory here.
 	if len(restrictToEntryIDs) > 0 && req != nil {
 		filtered := models[:0]
 		for _, m := range models {
@@ -559,6 +814,7 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 		if err != nil {
 			return nil, err
 		}
+
 		resp.Entries = append(resp.Entries, &common.RegistrationEntry{
 			EntryId:        m.EntryID,
 			Selectors:      selectors,

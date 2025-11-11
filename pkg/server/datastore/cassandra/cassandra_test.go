@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -241,6 +242,14 @@ func (s *PluginSuite) truncateAllTables() error {
 	return nil
 }
 
+func (s *PluginSuite) getTestDataFromJSONFile(filePath string, jsonValue any) {
+	entriesJSON, err := os.ReadFile(filePath)
+	s.Require().NoError(err)
+
+	err = json.Unmarshal(entriesJSON, &jsonValue)
+	s.Require().NoError(err)
+}
+
 /*
 	func (s *PluginSuite) TestBundleCRUD() {
 		dstest.TestBundleCRUD(s.T(), s.ds, s.cert, s.cacert)
@@ -448,7 +457,6 @@ func (s *PluginSuite) truncateAllTables() error {
 		dstest.TestDeleteBundleDissociateRegistrationEntries(s.T(), s.ds, s.cert)
 	}
 
-// WIP
 
 	func (s *PluginSuite) TestPruneRegistrationEntryEvents() {
 		newDS := func() (datastore.DataStore, func()) {
@@ -462,19 +470,13 @@ func (s *PluginSuite) truncateAllTables() error {
 		// Run the migrated test against a fresh datastore so EventIDs start at 1
 		dstest.TestPruneRegistrationEntryEvents(s.T(), ds)
 	}
-*/
+
 func (s *PluginSuite) TestListRegistrationEntryEvents() {
 	// Delegate to the shared standalone test (no extra callbacks needed).
 	dstest.TestListRegistrationEntryEvents(s.T(), s.ds)
 }
 
-func (s *PluginSuite) getTestDataFromJSONFile(filePath string, jsonValue any) {
-	entriesJSON, err := os.ReadFile(filePath)
-	s.Require().NoError(err)
 
-	err = json.Unmarshal(entriesJSON, &jsonValue)
-	s.Require().NoError(err)
-}
 
 func (s *PluginSuite) TestListEntriesBySelectorMatchAny() {
 	// newDS: returns a fresh datastore and a cleanup that closes it
@@ -543,5 +545,129 @@ func (s *PluginSuite) TestListEntriesByFederatesWithMatchAny() {
 		s.T(),
 		newDS,
 		loadEntries,
+	)
+}
+*/
+// WIP:
+
+func (s *PluginSuite) TestListEntriesByFederatesWithSubset() {
+	// newDS: returns a fresh datastore, with Close() encapsulated in the cleanup func
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.ds
+		s.truncateAllTables()
+		cleanup := func() {}
+		return ds, cleanup
+	}
+
+	// Load test entries from JSON (reusing your helper)
+	allEntries := make([]*common.RegistrationEntry, 0)
+	s.getTestDataFromJSONFile(filepath.Join("testdata", "entries_federates_with.json"), &allEntries)
+
+	// Delegate to shared test body
+	dstest.TestListEntriesByFederatesWithSubset(
+		s.T(),
+		newDS,
+		allEntries,
+	)
+}
+
+func (s *PluginSuite) TestListEntriesByFederatesWithExact() {
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.ds
+		s.truncateAllTables()
+		cleanup := func() {}
+		return ds, cleanup
+	}
+
+	dstest.TestListEntriesByFederatesWithExact(
+		s.T(),
+		newDS,
+	)
+}
+
+func (s *PluginSuite) TestListSelectorEntriesSuperset() {
+	// Prepare the static test data once here
+	allEntries := make([]*common.RegistrationEntry, 0)
+	s.getTestDataFromJSONFile(filepath.Join("testdata", "entries.json"), &allEntries)
+
+	// newDS: returns a fresh datastore and a cleanup that calls Close()
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.ds
+		s.truncateAllTables()
+		cleanup := func() {}
+		return ds, cleanup
+	}
+
+	dstest.TestListSelectorEntriesSuperset(s.T(), newDS, allEntries)
+}
+
+func (s *PluginSuite) TestListEntriesBySelectorSubset() {
+	// newDS: returns a fresh datastore, with Close() handled by the returned cleanup func
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.ds
+		s.truncateAllTables()
+		cleanup := func() {}
+		return ds, cleanup
+	}
+
+	// loadEntries: adapt s.getTestDataFromJSONFile(path string, any) to the expected signature
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
+
+	dstest.TestListEntriesBySelectorSubset(
+		s.T(),
+		newDS,
+		loadEntries,
+	)
+}
+
+func (s *PluginSuite) TestListSelectorEntries() {
+	// newDS: returns a fresh datastore and a cleanup that closes it
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.ds
+		s.truncateAllTables()
+		cleanup := func() {}
+		return ds, cleanup
+	}
+
+	// loadEntries adapts s.getTestDataFromJSONFile(path string, jsonValue any)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
+
+	dstest.TestListSelectorEntries(
+		s.T(),
+		newDS,
+		loadEntries,
+	)
+}
+
+func (s *PluginSuite) TestListParentIDEntries() {
+	// newDS: returns a fresh datastore, with Close() hidden inside t.Cleanup
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.ds
+		s.truncateAllTables()
+		cleanup := func() {}
+		return ds, cleanup
+	}
+
+	// loadEntries: adapt s.getTestDataFromJSONFile(path string, jsonValue any)
+	// to the signature the shared test expects: func(path string, out *[]*common.RegistrationEntry)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries) // uses "any" param under the hood
+		*out = entries
+	}
+
+	// Delegate to the shared test body
+	dstest.TestListParentIDEntries(
+		s.T(),
+		newDS,       // creates a ds and auto-closes via t.Cleanup
+		loadEntries, // loads testdata/entries.json into []*common.RegistrationEntry
 	)
 }
