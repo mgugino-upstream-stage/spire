@@ -671,3 +671,12 @@ func (s *PluginSuite) TestListParentIDEntries() {
 		loadEntries, // loads testdata/entries.json into []*common.RegistrationEntry
 	)
 }
+
+func (s *PluginSuite) TestUpdateRegistrationEntry() {
+	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
+		s.Require().NoError(err)
+		return out
+	}
+	dstest.TestUpdateRegistrationEntry(s.T(), s.ds, create)
+}

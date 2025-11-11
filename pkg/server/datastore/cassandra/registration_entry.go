@@ -898,7 +898,7 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		return nil, err
 	}
 	if existingEntry == nil {
-		return nil, newError("registration entry not found: %s", e.EntryId)
+		return nil, newNotFoundError("datastore-sql: record not found: %s", e.EntryId)
 	}
 
 	// If FederatesWith is changing, validate referenced bundles exist
@@ -922,7 +922,7 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 	const selQ = `SELECT revision_number, created_at FROM registered_entries WHERE entry_id = ?`
 	if err := ds.session.Query(selQ, e.EntryId).Scan(&currentRev, &createdAt); err != nil {
 		if err == gocql.ErrNotFound {
-			return nil, newError("registration entry not found: %s", e.EntryId)
+			return nil, newNotFoundError("datastore-sql: record not found: %s", e.EntryId)
 		}
 		return nil, newError("failed to read registration entry: %v", err)
 	}
