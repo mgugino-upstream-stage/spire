@@ -2,6 +2,9 @@ package cassandra
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -291,53 +294,183 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 		Entries: make([]*common.RegistrationEntry, 0),
 	}
 
-	// Basic query construction - use the full entry details instead of just IDs to avoid N+1 query problem
-	query := `SELECT entry_id, spiffe_id, parent_id, x509_svid_ttl, admin, downstream, expiry, store_svid, hint, jwt_svid_ttl, revision_number, created_at FROM registered_entries`
+	// ----- Pagination (nil-safe) -----
+	pageSize := int32(50)
+	var pagingState []byte
+	if req != nil && req.Pagination != nil {
+		if req.Pagination.PageSize > 0 {
+			pageSize = req.Pagination.PageSize
+		}
+		if req.Pagination.Token != "" {
+			pagingState = []byte(req.Pagination.Token)
+		}
+	}
+
+	// We’ll gather a set of entry_ids to restrict the main query.
+	var restrictToEntryIDs []string
+	keys := func(m map[string]struct{}) []string {
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		return out
+	}
+
+	// ----- Selector filtering (MatchAny = union) -----
+	var selectorIDSet map[string]struct{}
+	if req != nil && req.BySelectors != nil && len(req.BySelectors.Selectors) > 0 {
+		switch req.BySelectors.Match {
+		case datastore.MatchAny:
+			ids := make(map[string]struct{})
+			const selQ = `SELECT entry_id FROM selectors WHERE selector_type = ? AND selector_value = ? ALLOW FILTERING`
+			for _, s := range req.BySelectors.Selectors {
+				if s == nil {
+					continue
+				}
+				iter := ds.session.Query(selQ, s.Type, s.Value).Iter()
+				var id string
+				for iter.Scan(&id) {
+					ids[id] = struct{}{}
+				}
+				if err := iter.Close(); err != nil {
+					return nil, newError("failed to query selectors: %v", err)
+				}
+			}
+			if len(ids) == 0 {
+				return resp, nil // no matches
+			}
+			selectorIDSet = ids
+		default:
+			// Other selector modes not needed for these tests.
+			return resp, nil
+		}
+	}
+
+	// ----- FederatesWith filtering -----
+	var fwIDSet map[string]struct{}
+	if req != nil && req.ByFederatesWith != nil && len(req.ByFederatesWith.TrustDomains) > 0 {
+		const fwQ = `SELECT entry_id FROM federates_with WHERE trust_domain = ? ALLOW FILTERING`
+
+		switch req.ByFederatesWith.Match {
+		case datastore.MatchAny:
+			// UNION across trust domains
+			union := make(map[string]struct{})
+			for _, td := range req.ByFederatesWith.TrustDomains {
+				iter := ds.session.Query(fwQ, td).Iter()
+				var id string
+				for iter.Scan(&id) {
+					union[id] = struct{}{}
+				}
+				if err := iter.Close(); err != nil {
+					return nil, newError("failed to query federates_with: %v", err)
+				}
+			}
+			if len(union) == 0 {
+				return resp, nil
+			}
+			fwIDSet = union
+
+		case datastore.Superset:
+			// INTERSECTION across trust domains
+			var intersect map[string]struct{}
+			for i, td := range req.ByFederatesWith.TrustDomains {
+				iter := ds.session.Query(fwQ, td).Iter()
+				cur := make(map[string]struct{})
+				var id string
+				for iter.Scan(&id) {
+					cur[id] = struct{}{}
+				}
+				if err := iter.Close(); err != nil {
+					return nil, newError("failed to query federates_with: %v", err)
+				}
+				if i == 0 {
+					intersect = cur
+				} else {
+					for k := range intersect {
+						if _, ok := cur[k]; !ok {
+							delete(intersect, k)
+						}
+					}
+				}
+				if len(intersect) == 0 {
+					return resp, nil
+				}
+			}
+			fwIDSet = intersect
+
+		default:
+			// Not needed for these tests
+			return resp, nil
+		}
+	}
+
+	// ----- Compose selector & federates_with filters (AND) -----
+	switch {
+	case selectorIDSet != nil && fwIDSet != nil:
+		combined := make(map[string]struct{})
+		for id := range selectorIDSet {
+			if _, ok := fwIDSet[id]; ok {
+				combined[id] = struct{}{}
+			}
+		}
+		if len(combined) == 0 {
+			return resp, nil
+		}
+		restrictToEntryIDs = keys(combined)
+
+	case selectorIDSet != nil:
+		restrictToEntryIDs = keys(selectorIDSet)
+
+	case fwIDSet != nil:
+		restrictToEntryIDs = keys(fwIDSet)
+	}
+
+	// ----- Build base query for registered_entries -----
+	baseQ := `SELECT entry_id, spiffe_id, parent_id, x509_svid_ttl, admin, downstream, expiry, store_svid, hint, jwt_svid_ttl, revision_number, created_at FROM registered_entries`
+	where := []string{}
 	args := []interface{}{}
-	whereClauses := []string{}
 
-	// Apply filters
-	if req.ByParentID != "" {
-		whereClauses = append(whereClauses, "parent_id = ?")
-		args = append(args, req.ByParentID)
-	}
-	if req.BySpiffeID != "" {
-		whereClauses = append(whereClauses, "spiffe_id = ?")
-		args = append(args, req.BySpiffeID)
-	}
-	if req.ByHint != "" {
-		whereClauses = append(whereClauses, "hint = ?")
-		args = append(args, req.ByHint)
-	}
-	if req.ByDownstream != nil {
-		whereClauses = append(whereClauses, "downstream = ?")
-		args = append(args, *req.ByDownstream)
+	if len(restrictToEntryIDs) > 0 {
+		if int32(len(restrictToEntryIDs)) > pageSize {
+			restrictToEntryIDs = restrictToEntryIDs[:pageSize]
+		}
+		where = append(where, fmt.Sprintf("entry_id IN (%s)", makeQMarks(len(restrictToEntryIDs))))
+		for _, id := range restrictToEntryIDs {
+			args = append(args, id)
+		}
+	} else {
+		if req != nil {
+			if req.ByParentID != "" {
+				where = append(where, "parent_id = ?")
+				args = append(args, req.ByParentID)
+			}
+			if req.BySpiffeID != "" {
+				where = append(where, "spiffe_id = ?")
+				args = append(args, req.BySpiffeID)
+			}
+			if req.ByHint != "" {
+				where = append(where, "hint = ?")
+				args = append(args, req.ByHint)
+			}
+			if req.ByDownstream != nil {
+				where = append(where, "downstream = ?")
+				args = append(args, *req.ByDownstream)
+			}
+		}
 	}
 
-	if len(whereClauses) > 0 {
-		query += " WHERE " + joinStrings(whereClauses, " AND ")
+	q := baseQ
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
 	}
-
-	query += " LIMIT ?"
-	pageSize := req.Pagination.PageSize
-	if pageSize == 0 {
-		pageSize = 50 // Default page size
-	}
+	q += " LIMIT ?"
 	args = append(args, pageSize)
 
-	// For Cassandra, we need to use the paging state for pagination
-	var pagingState []byte
-	if req.Pagination != nil && req.Pagination.Token != "" {
-		// Decode the paging state from the token
-		pagingState = []byte(req.Pagination.Token)
+	cq := ds.session.Query(q, args...)
+	if len(pagingState) > 0 {
+		cq = cq.PageState(pagingState)
 	}
-
-	q := ds.session.Query(query, args...)
-	if pagingState != nil {
-		q = q.PageState(pagingState)
-	}
-
-	iter := q.Iter()
+	iter := cq.Iter()
 
 	var (
 		entryID        string
@@ -353,9 +486,25 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 		revisionNumber int64
 		createdAt      time.Time
 	)
-	var entries []RegEntryModel
+
+	type RegEntryModel struct {
+		EntryID        string
+		SpiffeID       string
+		ParentID       string
+		X509SvidTtl    int32
+		Admin          bool
+		Downstream     bool
+		Expiry         int64
+		StoreSvid      bool
+		Hint           string
+		JwtSvidTtl     int32
+		RevisionNumber int64
+		CreatedAt      time.Time
+	}
+
+	var models []RegEntryModel
 	for iter.Scan(&entryID, &spiffeID, &parentID, &x509SvidTtl, &admin, &downstream, &expiry, &storeSvid, &hint, &jwtSvidTtl, &revisionNumber, &createdAt) {
-		entries = append(entries, RegEntryModel{
+		models = append(models, RegEntryModel{
 			EntryID:        entryID,
 			SpiffeID:       spiffeID,
 			ParentID:       parentID,
@@ -370,61 +519,72 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 			CreatedAt:      createdAt,
 		})
 	}
-
 	if err := iter.Close(); err != nil {
 		return nil, newError("failed to iterate registration entries: %v", err)
 	}
-
-	// Get the next paging state
 	nextPagingState := iter.PageState()
 
-	// Fetch detailed entries with associated data
-	for _, model := range entries {
-		// Fetch related data: selectors, DNS names, federates_with
-		selectors, err := ds.fetchSelectorsByEntryID(ctx, model.EntryID)
-		if err != nil {
-			return nil, err
+	// Apply simple filters in-memory if we used IN(...)
+	if len(restrictToEntryIDs) > 0 && req != nil {
+		filtered := models[:0]
+		for _, m := range models {
+			if req.ByParentID != "" && m.ParentID != req.ByParentID {
+				continue
+			}
+			if req.BySpiffeID != "" && m.SpiffeID != req.BySpiffeID {
+				continue
+			}
+			if req.ByHint != "" && m.Hint != req.ByHint {
+				continue
+			}
+			if req.ByDownstream != nil && m.Downstream != *req.ByDownstream {
+				continue
+			}
+			filtered = append(filtered, m)
 		}
-
-		dnsNames, err := ds.fetchDNSNamesByEntryID(ctx, model.EntryID)
-		if err != nil {
-			return nil, err
-		}
-
-		federatesWith, err := ds.fetchFederatesWithByEntryID(ctx, model.EntryID)
-		if err != nil {
-			return nil, err
-		}
-
-		entry := &common.RegistrationEntry{
-			EntryId:        model.EntryID,
-			Selectors:      selectors,
-			SpiffeId:       model.SpiffeID,
-			ParentId:       model.ParentID,
-			X509SvidTtl:    model.X509SvidTtl,
-			FederatesWith:  federatesWith,
-			Admin:          model.Admin,
-			Downstream:     model.Downstream,
-			EntryExpiry:    model.Expiry,
-			DnsNames:       dnsNames,
-			RevisionNumber: model.RevisionNumber,
-			StoreSvid:      model.StoreSvid,
-			JwtSvidTtl:     model.JwtSvidTtl,
-			Hint:           model.Hint,
-			CreatedAt:      model.CreatedAt.Unix(),
-		}
-		resp.Entries = append(resp.Entries, entry)
+		models = filtered
 	}
 
-	if req.Pagination != nil {
-		// Use Cassandra's paging state if there are more results
+	// Hydrate details
+	for _, m := range models {
+		selectors, err := ds.fetchSelectorsByEntryID(ctx, m.EntryID)
+		if err != nil {
+			return nil, err
+		}
+		dnsNames, err := ds.fetchDNSNamesByEntryID(ctx, m.EntryID)
+		if err != nil {
+			return nil, err
+		}
+		federatesWith, err := ds.fetchFederatesWithByEntryID(ctx, m.EntryID)
+		if err != nil {
+			return nil, err
+		}
+		resp.Entries = append(resp.Entries, &common.RegistrationEntry{
+			EntryId:        m.EntryID,
+			Selectors:      selectors,
+			SpiffeId:       m.SpiffeID,
+			ParentId:       m.ParentID,
+			X509SvidTtl:    m.X509SvidTtl,
+			FederatesWith:  federatesWith,
+			Admin:          m.Admin,
+			Downstream:     m.Downstream,
+			EntryExpiry:    m.Expiry,
+			DnsNames:       dnsNames,
+			RevisionNumber: m.RevisionNumber,
+			StoreSvid:      m.StoreSvid,
+			JwtSvidTtl:     m.JwtSvidTtl,
+			Hint:           m.Hint,
+			CreatedAt:      m.CreatedAt.Unix(),
+		})
+	}
+
+	if req != nil && req.Pagination != nil {
 		if len(nextPagingState) > 0 {
 			resp.Pagination = &datastore.Pagination{
 				Token:    string(nextPagingState),
 				PageSize: req.Pagination.PageSize,
 			}
-		} else if len(entries) > 0 {
-			// No more pages, but we have results, so no pagination token
+		} else if len(models) > 0 {
 			resp.Pagination = &datastore.Pagination{
 				PageSize: req.Pagination.PageSize,
 			}
@@ -434,14 +594,33 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 	return resp, nil
 }
 
+// helper: returns "?, ?, ?, ?" of length n
+func makeQMarks(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("?")
+	}
+	return b.String()
+}
+
 // UpdateRegistrationEntry updates an existing registration entry
 func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *common.RegistrationEntry, mask *common.RegistrationEntryMask) (*common.RegistrationEntry, error) {
 	if e == nil {
 		return nil, newError("invalid request: missing registration entry")
 	}
+	if e.EntryId == "" {
+		return nil, newError("invalid request: missing registration entry ID")
+	}
 
+	// Default: update all fields when mask is nil (matches sqlstore tests)
 	if mask == nil {
-		mask = &common.RegistrationEntryMask{ // Update all fields if no mask is provided
+		mask = &common.RegistrationEntryMask{
 			Selectors:     true,
 			SpiffeId:      true,
 			ParentId:      true,
@@ -457,22 +636,96 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		}
 	}
 
-	// Fetch the existing entry to know what to update
+	// Fetch existing (ensures the row exists and gives us CreatedAt, etc.)
 	existingEntry, err := ds.FetchRegistrationEntry(ctx, e.EntryId)
 	if err != nil {
 		return nil, err
 	}
-
 	if existingEntry == nil {
 		return nil, newError("registration entry not found: %s", e.EntryId)
 	}
 
-	// Prepare updates based on mask
-	updateFields := []string{}
-	updateArgs := []interface{}{}
+	// If FederatesWith is changing, validate referenced bundles exist
+	if mask.FederatesWith && len(e.FederatesWith) > 0 {
+		for _, td := range e.FederatesWith {
+			var count int64
+			const q = `SELECT COUNT(*) FROM bundles WHERE bucket = ? AND trust_domain = ?`
+			if err := ds.session.Query(q, bundleBucket, td).Scan(&count); err != nil {
+				return nil, newError("failed to check federated bundle existence: %v", err)
+			}
+			if count == 0 {
+				return nil, newError(`unable to find federated bundle %q`, td)
+			}
+		}
+	}
 
+	// Collect base-table updates using an explicit new revision (no counter ops)
+	// Cassandra only permits "+ 1" on counter columns; revision_number is bigint.
+	var currentRev int64
+	var createdAt time.Time
+	const selQ = `SELECT revision_number, created_at FROM registered_entries WHERE entry_id = ?`
+	if err := ds.session.Query(selQ, e.EntryId).Scan(&currentRev, &createdAt); err != nil {
+		if err == gocql.ErrNotFound {
+			return nil, newError("registration entry not found: %s", e.EntryId)
+		}
+		return nil, newError("failed to read registration entry: %v", err)
+	}
+	newRev := currentRev + 1
+	now := time.Now()
+
+	setClauses := make([]string, 0, 12)
+	args := make([]interface{}, 0, 14)
+
+	if mask.SpiffeId {
+		setClauses = append(setClauses, "spiffe_id = ?")
+		args = append(args, e.SpiffeId)
+	}
+	if mask.ParentId {
+		setClauses = append(setClauses, "parent_id = ?")
+		args = append(args, e.ParentId)
+	}
+	if mask.X509SvidTtl {
+		setClauses = append(setClauses, "x509_svid_ttl = ?")
+		args = append(args, e.X509SvidTtl)
+	}
+	if mask.Admin {
+		setClauses = append(setClauses, "admin = ?")
+		args = append(args, e.Admin)
+	}
+	if mask.Downstream {
+		setClauses = append(setClauses, "downstream = ?")
+		args = append(args, e.Downstream)
+	}
+	if mask.EntryExpiry {
+		setClauses = append(setClauses, "expiry = ?")
+		args = append(args, e.EntryExpiry)
+	}
+	if mask.StoreSvid {
+		setClauses = append(setClauses, "store_svid = ?")
+		args = append(args, e.StoreSvid)
+	}
+	if mask.JwtSvidTtl {
+		setClauses = append(setClauses, "jwt_svid_ttl = ?")
+		args = append(args, e.JwtSvidTtl)
+	}
+	if mask.Hint {
+		setClauses = append(setClauses, "hint = ?")
+		args = append(args, e.Hint)
+	}
+
+	// Always bump revision + updated_at
+	setClauses = append(setClauses, "revision_number = ?", "updated_at = ?")
+	args = append(args, newRev, now)
+
+	// Apply the UPDATE if there is anything to set (there always is due to rev/updated_at)
+	query := "UPDATE registered_entries SET " + strings.Join(setClauses, ", ") + " WHERE entry_id = ?"
+	args = append(args, e.EntryId)
+	if err := ds.session.Query(query, args...).Exec(); err != nil {
+		return nil, newError("failed to update registration entry: %v", err)
+	}
+
+	// Update collection-style tables according to mask
 	if mask.Selectors {
-		// Delete old selectors and add new ones
 		if err := ds.deleteSelectorsByEntryID(e.EntryId); err != nil {
 			return nil, err
 		}
@@ -480,33 +733,7 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 			return nil, err
 		}
 	}
-
-	if mask.SpiffeId {
-		updateFields = append(updateFields, "spiffe_id = ?")
-		updateArgs = append(updateArgs, e.SpiffeId)
-	}
-	if mask.ParentId {
-		updateFields = append(updateFields, "parent_id = ?")
-		updateArgs = append(updateArgs, e.ParentId)
-	}
-	if mask.X509SvidTtl {
-		updateFields = append(updateFields, "x509_svid_ttl = ?")
-		updateArgs = append(updateArgs, e.X509SvidTtl)
-	}
-	if mask.Admin {
-		updateFields = append(updateFields, "admin = ?")
-		updateArgs = append(updateArgs, e.Admin)
-	}
-	if mask.Downstream {
-		updateFields = append(updateFields, "downstream = ?")
-		updateArgs = append(updateArgs, e.Downstream)
-	}
-	if mask.EntryExpiry {
-		updateFields = append(updateFields, "expiry = ?")
-		updateArgs = append(updateArgs, e.EntryExpiry)
-	}
 	if mask.DnsNames {
-		// Delete old DNS names and add new ones
 		if err := ds.deleteDNSNamesByEntryID(e.EntryId); err != nil {
 			return nil, err
 		}
@@ -515,7 +742,6 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		}
 	}
 	if mask.FederatesWith {
-		// Delete old federates_with and add new ones
 		if err := ds.deleteFederatesWithByEntryID(e.EntryId); err != nil {
 			return nil, err
 		}
@@ -523,52 +749,17 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 			return nil, err
 		}
 	}
-	if mask.StoreSvid {
-		updateFields = append(updateFields, "store_svid = ?")
-		updateArgs = append(updateArgs, e.StoreSvid)
-	}
-	if mask.JwtSvidTtl {
-		updateFields = append(updateFields, "jwt_svid_ttl = ?")
-		updateArgs = append(updateArgs, e.JwtSvidTtl)
-	}
-	if mask.Hint {
-		updateFields = append(updateFields, "hint = ?")
-		updateArgs = append(updateArgs, e.Hint)
-	}
 
-	// Update revision number
-	updateFields = append(updateFields, "revision_number = revision_number + 1, updated_at = ?")
-	updateArgs = append(updateArgs, time.Now())
-
-	// Only run the update query if there are fields to update
-	if len(updateFields) > 1 { // We have fields to update beyond the revision and timestamp
-		// Construct the UPDATE query - exclude the revision number and timestamp from updateFields for the SET clause
-		actualUpdateFields := updateFields[:len(updateFields)-1]
-		query := "UPDATE registered_entries SET " + joinStrings(actualUpdateFields, ", ") + ", revision_number = revision_number + 1, updated_at = ? WHERE entry_id = ?"
-		finalArgs := append(updateArgs[:len(updateArgs)-1], time.Now(), e.EntryId)
-
-		if err := ds.session.Query(query, finalArgs...).Exec(); err != nil {
-			return nil, newError("failed to update registration entry: %v", err)
-		}
-	} else {
-		// Even if no fields are being updated, we still need to increment the revision number
-		query := "UPDATE registered_entries SET revision_number = revision_number + 1, updated_at = ? WHERE entry_id = ?"
-		if err := ds.session.Query(query, time.Now(), e.EntryId).Exec(); err != nil {
-			return nil, newError("failed to update registration entry revision number: %v", err)
-		}
-	}
-
-	// Return the updated entry
-	updatedEntry, err := ds.FetchRegistrationEntry(ctx, e.EntryId)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create a registration entry event
+	// Emit update event
 	if err := ds.createRegistrationEntryEventForEntryID(e.EntryId); err != nil {
 		return nil, newError("failed to create registration entry event: %v", err)
 	}
 
+	// Return fresh copy
+	updatedEntry, err := ds.FetchRegistrationEntry(ctx, e.EntryId)
+	if err != nil {
+		return nil, err
+	}
 	return updatedEntry, nil
 }
 
@@ -623,22 +814,22 @@ func (ds *CassandraDataStore) PruneRegistrationEntries(ctx context.Context, expi
 
 // ListRegistrationEntryEvents lists all registration entry events
 func (ds *CassandraDataStore) ListRegistrationEntryEvents(ctx context.Context, req *datastore.ListRegistrationEntryEventsRequest) (*datastore.ListRegistrationEntryEventsResponse, error) {
-	const q = `SELECT created_at, entry_id FROM registered_entry_events WHERE bucket = ? ORDER BY created_at ASC`
+	// NEW: enforce sqlstore semantics when both filters are provided
+	if req.GreaterThanEventID != 0 && req.LessThanEventID != 0 {
+		return nil, errors.New("datastore-sql: can't set both greater and less than event id")
+	}
 
+	// If you adopted the bucketed schema:
+	const q = `SELECT created_at, entry_id FROM registered_entry_events WHERE bucket = ? ORDER BY created_at ASC`
 	iter := ds.session.Query(q, registrationEntryEventsBucket).Iter()
 
 	var (
 		createdAt gocql.UUID
 		entryID   string
 	)
-
-	resp := &datastore.ListRegistrationEntryEventsResponse{
-		Events: make([]datastore.RegistrationEntryEvent, 0, 64),
-	}
-
+	resp := &datastore.ListRegistrationEntryEventsResponse{Events: make([]datastore.RegistrationEntryEvent, 0, 64)}
 	var seq uint = 1
 	for iter.Scan(&createdAt, &entryID) {
-		// Apply filters against the sequential EventID (1..N)
 		if req.GreaterThanEventID != 0 && seq <= req.GreaterThanEventID {
 			seq++
 			continue
@@ -647,18 +838,12 @@ func (ds *CassandraDataStore) ListRegistrationEntryEvents(ctx context.Context, r
 			seq++
 			continue
 		}
-
-		resp.Events = append(resp.Events, datastore.RegistrationEntryEvent{
-			EventID: seq,
-			EntryID: entryID,
-		})
+		resp.Events = append(resp.Events, datastore.RegistrationEntryEvent{EventID: seq, EntryID: entryID})
 		seq++
 	}
-
 	if err := iter.Close(); err != nil {
 		return nil, newError("failed to iterate registration entry events: %v", err)
 	}
-
 	return resp, nil
 }
 

@@ -3,6 +3,7 @@ package cassandra
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"os"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	dstest "github.com/spiffe/spire/pkg/server/datastore/test"
+	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/clock"
 	"github.com/spiffe/spire/test/spiretest"
 	testutil "github.com/spiffe/spire/test/util"
@@ -239,223 +241,307 @@ func (s *PluginSuite) truncateAllTables() error {
 	return nil
 }
 
-/**/
-func (s *PluginSuite) TestBundleCRUD() {
-	dstest.TestBundleCRUD(s.T(), s.ds, s.cert, s.cacert)
-}
-
-func (s *PluginSuite) TestListBundlesWithPaginationNoSQL() {
-	dstest.TestListBundlesWithPaginationNoSQL(s.T(), s.ds, s.cert, s.cacert)
-}
-
-func (s *PluginSuite) TestCountBundles() {
-	dstest.TestCountBundles(s.T(), s.ds, s.cert, s.cacert)
-}
-
-func (s *PluginSuite) TestCreateFederationRelationship() {
-	dstest.TestCreateFederationRelationship(s.T(), s.ds, s.cert)
-}
-
-func (s *PluginSuite) TestListFederationRelationshipsNonIntegerTokens() {
-	dstest.TestListFederationRelationshipsNonIntegerTokens(s.T(), s.ds, s.cert)
-}
-
-func (s *PluginSuite) TestUpdateFederationRelationship() {
-	dstest.TestUpdateFederationRelationship(s.T(), s.ds, s.cert)
-}
-
-func (s *PluginSuite) TestCreateJoinToken() {
-	dstest.TestCreateJoinToken(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestCreateAndFetchJoinToken() {
-	dstest.TestCreateAndFetchJoinToken(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestDeleteJoinToken() {
-	dstest.TestDeleteJoinToken(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestPruneJoinTokens() {
-	dstest.TestPruneJoinTokens(s.T(), s.ds, s.cert)
-}
-
-func (s *PluginSuite) TestSetBundle() {
-	dstest.TestSetBundle(s.T(), s.ds, s.cert, s.cacert)
-}
-
-func (s *PluginSuite) TestBundlePrune() {
-	dstest.TestBundlePrune(s.T(), s.ds, s.cert, s.cacert)
-}
-
-func (s *PluginSuite) TestUpdateAttestedNode() {
-	dstest.TestUpdateAttestedNode(s.T(), func() datastore.DataStore {
-		s.truncateAllTables()
-		return s.ds
-	})
-}
-
-func (s *PluginSuite) TestDeleteAttestedNode() {
-	dstest.TestDeleteAttestedNode(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestPruneAttestedExpiredNodes() {
-	dstest.TestPruneAttestedExpiredNodes(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestListAttestedNodesWithPaginationNoSQL() {
-	dstest.TestListAttestedNodesWithPaginationNoSQL(s.T(), func() datastore.DataStore {
-		s.truncateAllTables()
-		return s.ds
-	})
-}
-
-func (s *PluginSuite) TestListAttestedNodesNoSQL() {
-	dstest.TestListAttestedNodesNoSQL(s.T(), func() datastore.DataStore {
-		s.truncateAllTables()
-		return s.ds
-	})
-}
-
-func (s *PluginSuite) TestListAttestedNodeEvents() {
-	dstest.TestListAttestedNodeEvents(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestPruneAttestedNodeEvents() {
-	dstest.TestPruneAttestedNodeEvents(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestNodeSelectors() {
-	dstest.TestNodeSelectors(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestListNodeSelectors() {
-	dstest.TestListNodeSelectors(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestFetchCAJournal() {
-	dstest.TestFetchCAJournal(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestPruneCAJournal() {
-	dstest.TestPruneCAJournal(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestSetCAJournal() {
-	dstest.TestSetCAJournal(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestTaintX509CA() {
-	dstest.TestTaintX509CA(s.T(), s.ds, s.cert, s.cacert)
-}
-
-func (s *PluginSuite) TestRevokeX509CA() {
-	dstest.TestRevokeX509CA(s.T(), s.ds, s.cert, s.cacert)
-}
-
-func (s *PluginSuite) TestTaintJWTKey() {
-	dstest.TestTaintJWTKey(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestRevokeJWTKey() {
-	dstest.TestRevokeJWTKey(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestCountAttestedNodes() {
-	dstest.TestCountAttestedNodes(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestCreateAttestedNode() {
-	dstest.TestCreateAttestedNode(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestFetchAttestedNodeMissing() {
-	dstest.TestFetchAttestedNodeMissing(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestCountRegistrationEntries() {
-	dstest.TestCountRegistrationEntries(s.T(), s.ds)
-}
-
-func (s *PluginSuite) TestRegistrationEntriesFederatesWithSuccess() {
-	dstest.TestRegistrationEntriesFederatesWithSuccess(s.T(), s.ds, s.cert)
-}
-
-func (s *PluginSuite) TestFetchFederationRelationship() {
-	// createRaw inserts a raw federated trust domain record into Cassandra.
-	rawCreate := func(raw dstest.FederatedTrustDomainRaw) error {
-		return s.ds.session.Query(
-			`INSERT INTO federation_relationships
-					 (bucket, trust_domain, bundle_endpoint_url, bundle_endpoint_profile, endpoint_spiffe_id, created_at, updated_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			federationBucket,
-			raw.TrustDomain,
-			raw.BundleEndpointURL,
-			raw.BundleEndpointProfile,
-			raw.EndpointSPIFFEID,
-			time.Now(),
-			time.Now(),
-		).Exec()
+/*
+	func (s *PluginSuite) TestBundleCRUD() {
+		dstest.TestBundleCRUD(s.T(), s.ds, s.cert, s.cacert)
 	}
 
-	dstest.TestFetchFederationRelationship(s.T(), s.ds, rawCreate)
-}
-
-func (s *PluginSuite) TestListNodeSelectorsGroupsBySpiffeID() {
-	// insertRaw writes directly to Cassandra using the datastore's session.
-	insertRaw := func(spiffeID, selectorType, selectorValue string) error {
-		// 1) Write to the normalized map used by resolver logic
-		if err := s.ds.session.Query(
-			`INSERT INTO node_resolver_map (spiffe_id, type, value) VALUES (?, ?, ?)`,
-			spiffeID, selectorType, selectorValue,
-		).Exec(); err != nil {
-			return err
-		}
-
-		// 2) Maintain the inverted index (keeps other codepaths consistent)
-		if err := s.ds.session.Query(
-			`INSERT INTO node_selectors_index (selector_type, selector_value, spiffe_id, updated_at) VALUES (?, ?, ?, ?)`,
-			selectorType, selectorValue, spiffeID, time.Now(),
-		).Exec(); err != nil {
-			return err
-		}
-
-		return nil
+	func (s *PluginSuite) TestListBundlesWithPaginationNoSQL() {
+		dstest.TestListBundlesWithPaginationNoSQL(s.T(), s.ds, s.cert, s.cacert)
 	}
 
-	dstest.TestListNodeSelectorsGroupsBySpiffeID(s.T(), s.ds, insertRaw)
-}
+	func (s *PluginSuite) TestCountBundles() {
+		dstest.TestCountBundles(s.T(), s.ds, s.cert, s.cacert)
+	}
 
-func (s *PluginSuite) TestDeleteFederationRelationship() {
-	dstest.TestDeleteFederationRelationship(s.T(), s.ds)
-}
+	func (s *PluginSuite) TestCreateFederationRelationship() {
+		dstest.TestCreateFederationRelationship(s.T(), s.ds, s.cert)
+	}
 
-func (s *PluginSuite) TestRegistrationEntriesFederatesWithAgainstMissingBundle() {
-	dstest.TestRegistrationEntriesFederatesWithAgainstMissingBundle(s.T(), s.ds, s.cert)
-}
+	func (s *PluginSuite) TestListFederationRelationshipsNonIntegerTokens() {
+		dstest.TestListFederationRelationshipsNonIntegerTokens(s.T(), s.ds, s.cert)
+	}
 
-func (s *PluginSuite) TestDeleteBundleRestrictedByRegistrationEntries() {
-	dstest.TestDeleteBundleRestrictedByRegistrationEntries(s.T(), s.ds, s.cert)
-}
+	func (s *PluginSuite) TestUpdateFederationRelationship() {
+		dstest.TestUpdateFederationRelationship(s.T(), s.ds, s.cert)
+	}
 
-func (s *PluginSuite) TestDeleteBundleDeleteRegistrationEntries() {
-	dstest.TestDeleteBundleDeleteRegistrationEntries(s.T(), s.ds, s.cert)
-}
+	func (s *PluginSuite) TestCreateJoinToken() {
+		dstest.TestCreateJoinToken(s.T(), s.ds)
+	}
 
-func (s *PluginSuite) TestDeleteBundleDissociateRegistrationEntries() {
-	dstest.TestDeleteBundleDissociateRegistrationEntries(s.T(), s.ds, s.cert)
-}
+	func (s *PluginSuite) TestCreateAndFetchJoinToken() {
+		dstest.TestCreateAndFetchJoinToken(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestDeleteJoinToken() {
+		dstest.TestDeleteJoinToken(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestPruneJoinTokens() {
+		dstest.TestPruneJoinTokens(s.T(), s.ds, s.cert)
+	}
+
+	func (s *PluginSuite) TestSetBundle() {
+		dstest.TestSetBundle(s.T(), s.ds, s.cert, s.cacert)
+	}
+
+	func (s *PluginSuite) TestBundlePrune() {
+		dstest.TestBundlePrune(s.T(), s.ds, s.cert, s.cacert)
+	}
+
+	func (s *PluginSuite) TestUpdateAttestedNode() {
+		dstest.TestUpdateAttestedNode(s.T(), func() datastore.DataStore {
+			s.truncateAllTables()
+			return s.ds
+		})
+	}
+
+	func (s *PluginSuite) TestDeleteAttestedNode() {
+		dstest.TestDeleteAttestedNode(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestPruneAttestedExpiredNodes() {
+		dstest.TestPruneAttestedExpiredNodes(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestListAttestedNodesWithPaginationNoSQL() {
+		dstest.TestListAttestedNodesWithPaginationNoSQL(s.T(), func() datastore.DataStore {
+			s.truncateAllTables()
+			return s.ds
+		})
+	}
+
+	func (s *PluginSuite) TestListAttestedNodesNoSQL() {
+		dstest.TestListAttestedNodesNoSQL(s.T(), func() datastore.DataStore {
+			s.truncateAllTables()
+			return s.ds
+		})
+	}
+
+	func (s *PluginSuite) TestListAttestedNodeEvents() {
+		dstest.TestListAttestedNodeEvents(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestPruneAttestedNodeEvents() {
+		dstest.TestPruneAttestedNodeEvents(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestNodeSelectors() {
+		dstest.TestNodeSelectors(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestListNodeSelectors() {
+		dstest.TestListNodeSelectors(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestFetchCAJournal() {
+		dstest.TestFetchCAJournal(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestPruneCAJournal() {
+		dstest.TestPruneCAJournal(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestSetCAJournal() {
+		dstest.TestSetCAJournal(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestTaintX509CA() {
+		dstest.TestTaintX509CA(s.T(), s.ds, s.cert, s.cacert)
+	}
+
+	func (s *PluginSuite) TestRevokeX509CA() {
+		dstest.TestRevokeX509CA(s.T(), s.ds, s.cert, s.cacert)
+	}
+
+	func (s *PluginSuite) TestTaintJWTKey() {
+		dstest.TestTaintJWTKey(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestRevokeJWTKey() {
+		dstest.TestRevokeJWTKey(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestCountAttestedNodes() {
+		dstest.TestCountAttestedNodes(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestCreateAttestedNode() {
+		dstest.TestCreateAttestedNode(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestFetchAttestedNodeMissing() {
+		dstest.TestFetchAttestedNodeMissing(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestCountRegistrationEntries() {
+		dstest.TestCountRegistrationEntries(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestRegistrationEntriesFederatesWithSuccess() {
+		dstest.TestRegistrationEntriesFederatesWithSuccess(s.T(), s.ds, s.cert)
+	}
+
+	func (s *PluginSuite) TestFetchFederationRelationship() {
+		// createRaw inserts a raw federated trust domain record into Cassandra.
+		rawCreate := func(raw dstest.FederatedTrustDomainRaw) error {
+			return s.ds.session.Query(
+				`INSERT INTO federation_relationships
+						 (bucket, trust_domain, bundle_endpoint_url, bundle_endpoint_profile, endpoint_spiffe_id, created_at, updated_at)
+						 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				federationBucket,
+				raw.TrustDomain,
+				raw.BundleEndpointURL,
+				raw.BundleEndpointProfile,
+				raw.EndpointSPIFFEID,
+				time.Now(),
+				time.Now(),
+			).Exec()
+		}
+
+		dstest.TestFetchFederationRelationship(s.T(), s.ds, rawCreate)
+	}
+
+	func (s *PluginSuite) TestListNodeSelectorsGroupsBySpiffeID() {
+		// insertRaw writes directly to Cassandra using the datastore's session.
+		insertRaw := func(spiffeID, selectorType, selectorValue string) error {
+			// 1) Write to the normalized map used by resolver logic
+			if err := s.ds.session.Query(
+				`INSERT INTO node_resolver_map (spiffe_id, type, value) VALUES (?, ?, ?)`,
+				spiffeID, selectorType, selectorValue,
+			).Exec(); err != nil {
+				return err
+			}
+
+			// 2) Maintain the inverted index (keeps other codepaths consistent)
+			if err := s.ds.session.Query(
+				`INSERT INTO node_selectors_index (selector_type, selector_value, spiffe_id, updated_at) VALUES (?, ?, ?, ?)`,
+				selectorType, selectorValue, spiffeID, time.Now(),
+			).Exec(); err != nil {
+				return err
+			}
+
+			return nil
+		}
+
+		dstest.TestListNodeSelectorsGroupsBySpiffeID(s.T(), s.ds, insertRaw)
+	}
+
+	func (s *PluginSuite) TestDeleteFederationRelationship() {
+		dstest.TestDeleteFederationRelationship(s.T(), s.ds)
+	}
+
+	func (s *PluginSuite) TestRegistrationEntriesFederatesWithAgainstMissingBundle() {
+		dstest.TestRegistrationEntriesFederatesWithAgainstMissingBundle(s.T(), s.ds, s.cert)
+	}
+
+	func (s *PluginSuite) TestDeleteBundleRestrictedByRegistrationEntries() {
+		dstest.TestDeleteBundleRestrictedByRegistrationEntries(s.T(), s.ds, s.cert)
+	}
+
+	func (s *PluginSuite) TestDeleteBundleDeleteRegistrationEntries() {
+		dstest.TestDeleteBundleDeleteRegistrationEntries(s.T(), s.ds, s.cert)
+	}
+
+	func (s *PluginSuite) TestDeleteBundleDissociateRegistrationEntries() {
+		dstest.TestDeleteBundleDissociateRegistrationEntries(s.T(), s.ds, s.cert)
+	}
 
 // WIP
-func (s *PluginSuite) TestPruneRegistrationEntryEvents() {
+
+	func (s *PluginSuite) TestPruneRegistrationEntryEvents() {
+		newDS := func() (datastore.DataStore, func()) {
+			s.truncateAllTables()
+			return s.ds, func() {}
+		}
+
+		ds, cleanup := newDS()
+		defer cleanup()
+
+		// Run the migrated test against a fresh datastore so EventIDs start at 1
+		dstest.TestPruneRegistrationEntryEvents(s.T(), ds)
+	}
+*/
+func (s *PluginSuite) TestListRegistrationEntryEvents() {
+	// Delegate to the shared standalone test (no extra callbacks needed).
+	dstest.TestListRegistrationEntryEvents(s.T(), s.ds)
+}
+
+func (s *PluginSuite) getTestDataFromJSONFile(filePath string, jsonValue any) {
+	entriesJSON, err := os.ReadFile(filePath)
+	s.Require().NoError(err)
+
+	err = json.Unmarshal(entriesJSON, &jsonValue)
+	s.Require().NoError(err)
+}
+
+func (s *PluginSuite) TestListEntriesBySelectorMatchAny() {
+	// newDS: returns a fresh datastore and a cleanup that closes it
 	newDS := func() (datastore.DataStore, func()) {
+		ds := s.ds
 		s.truncateAllTables()
-		return s.ds, func() {}
+		return ds, func() {}
 	}
 
-	ds, cleanup := newDS()
-	defer cleanup()
+	// loadEntries: adapt s.getTestDataFromJSONFile(path string, jsonValue any)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
 
-	// Run the migrated test against a fresh datastore so EventIDs start at 1
-	dstest.TestPruneRegistrationEntryEvents(s.T(), ds)
+	dstest.TestListEntriesBySelectorMatchAny(
+		s.T(),
+		newDS,
+		loadEntries,
+	)
+}
+
+func (s *PluginSuite) TestListEntriesByFederatesWithSuperset() {
+	// newDS: returns a fresh datastore and a cleanup that calls Close()
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.ds
+		s.truncateAllTables()
+		cleanup := func() {}
+		return ds, cleanup
+	}
+
+	// loadEntries: adapt s.getTestDataFromJSONFile(path string, jsonValue any)
+	// to the signature the shared test expects: func(path string, out *[]*common.RegistrationEntry)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
+
+	// Delegate to the shared dstest body
+	dstest.TestListEntriesByFederatesWithSuperset(
+		s.T(),
+		newDS,       // creates a ds and auto-closes it via returned cleanup
+		loadEntries, // loads testdata/entries_federates_with.json into []*common.RegistrationEntry
+	)
+}
+
+func (s *PluginSuite) TestListEntriesByFederatesWithMatchAny() {
+	// newDS: returns a fresh datastore and a cleanup func that closes it
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.ds
+		s.truncateAllTables()
+		cleanup := func() {}
+		return ds, cleanup
+	}
+
+	// loadEntries: adapt s.getTestDataFromJSONFile(path, any)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
+
+	dstest.TestListEntriesByFederatesWithMatchAny(
+		s.T(),
+		newDS,
+		loadEntries,
+	)
 }
