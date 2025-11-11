@@ -3,13 +3,18 @@ package dstest
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/gogo/status"
+	"github.com/sirupsen/logrus"
+	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/spiretest"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
@@ -150,7 +155,6 @@ func TestUpdateRegistrationEntryWithMask(
 	createBundle func(string),
 	createRegistrationEntry func(t *testing.T, ds datastore.DataStore, entry *common.RegistrationEntry) *common.RegistrationEntry,
 	deleteRegistrationEntry func(string),
-	assertCreatedAt func(*common.RegistrationEntry, int64),
 ) {
 	ctx := context.Background()
 	now := time.Now().Unix()
@@ -549,4 +553,379 @@ func TestDeleteRegistrationEntry(
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "record not found")
 	require.Nil(t, deleted)
+}
+
+func TestPruneRegistrationEntries(
+	t *testing.T,
+	ds datastore.DataStore,
+	hook interface {
+		AllEntries() []*logrus.Entry
+		LastEntry() *logrus.Entry
+	},
+) {
+	t.Helper()
+	ctx := context.Background()
+
+	now := time.Now()
+	entry := &common.RegistrationEntry{
+		Selectors: []*common.Selector{
+			{Type: "Type1", Value: "Value1"},
+			{Type: "Type2", Value: "Value2"},
+			{Type: "Type3", Value: "Value3"},
+		},
+		SpiffeId:    "SpiffeId",
+		ParentId:    "ParentId",
+		X509SvidTtl: 1,
+		EntryExpiry: now.Unix(),
+	}
+
+	createdRegistrationEntry, err := ds.CreateRegistrationEntry(ctx, entry)
+	require.NoError(t, err)
+
+	fetchedRegistrationEntry := &common.RegistrationEntry{}
+	defaultLastLog := spiretest.LogEntry{
+		Message: "Connected to SQL database",
+	}
+	prunedLogMessage := "Pruned an expired registration"
+
+	resp, err := ds.ListRegistrationEntryEvents(ctx, &datastore.ListRegistrationEntryEventsRequest{})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(resp.Events))
+	require.Equal(t, createdRegistrationEntry.EntryId, resp.Events[0].EntryID)
+
+	tests := []struct {
+		name                      string
+		time                      time.Time
+		expectedRegistrationEntry *common.RegistrationEntry
+		expectedLastLog           spiretest.LogEntry
+	}{
+		{
+			name:                      "Don't prune valid entries",
+			time:                      now.Add(-10 * time.Second),
+			expectedRegistrationEntry: createdRegistrationEntry,
+			expectedLastLog:           defaultLastLog,
+		},
+		{
+			name:                      "Don't prune exact ExpiresBefore",
+			time:                      now,
+			expectedRegistrationEntry: createdRegistrationEntry,
+			expectedLastLog:           defaultLastLog,
+		},
+		{
+			name:                      "Prune old entries",
+			time:                      now.Add(10 * time.Second),
+			expectedRegistrationEntry: (*common.RegistrationEntry)(nil),
+			expectedLastLog: spiretest.LogEntry{
+				Level:   logrus.InfoLevel,
+				Message: prunedLogMessage,
+				Data: logrus.Fields{
+					telemetry.SPIFFEID:       createdRegistrationEntry.SpiffeId,
+					telemetry.ParentID:       createdRegistrationEntry.ParentId,
+					telemetry.RegistrationID: createdRegistrationEntry.EntryId,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Get latest event id
+			resp, err := ds.ListRegistrationEntryEvents(ctx, &datastore.ListRegistrationEntryEventsRequest{})
+			require.NoError(t, err)
+			require.Greater(t, len(resp.Events), 0)
+			lastEventID := resp.Events[len(resp.Events)-1].EventID
+
+			// Prune events
+			err = ds.PruneRegistrationEntries(ctx, tt.time)
+			require.NoError(t, err)
+
+			fetchedRegistrationEntry, err = ds.FetchRegistrationEntry(ctx, createdRegistrationEntry.EntryId)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedRegistrationEntry, fetchedRegistrationEntry)
+
+			// Verify pruning triggers event creation
+			resp, err = ds.ListRegistrationEntryEvents(ctx, &datastore.ListRegistrationEntryEventsRequest{
+				GreaterThanEventID: lastEventID,
+			})
+			require.NoError(t, err)
+
+			if tt.expectedRegistrationEntry != nil {
+				require.Equal(t, 0, len(resp.Events))
+			} else {
+				require.Equal(t, 1, len(resp.Events))
+				require.Equal(t, createdRegistrationEntry.EntryId, resp.Events[0].EntryID)
+			}
+
+			// Log assertions identical to original
+			if tt.expectedLastLog.Message == prunedLogMessage {
+				spiretest.AssertLastLogs(t, hook.AllEntries(), []spiretest.LogEntry{tt.expectedLastLog})
+			} else {
+				assert.Equal(t, hook.LastEntry().Message, tt.expectedLastLog.Message)
+			}
+		})
+	}
+}
+
+func TestListParentIDEntries(
+	t *testing.T,
+	newDS func() (datastore.DataStore, func()),
+	loadEntries func(path string, out *[]*common.RegistrationEntry),
+) {
+	t.Helper()
+	ctx := context.Background()
+
+	now := time.Now().Unix()
+	allEntries := make([]*common.RegistrationEntry, 0)
+	loadEntries(filepath.Join("testdata", "entries.json"), &allEntries)
+
+	tests := []struct {
+		name                string
+		registrationEntries []*common.RegistrationEntry
+		parentID            string
+		expectedList        []*common.RegistrationEntry
+	}{
+		{
+			name:                "test_parentID_found",
+			registrationEntries: allEntries,
+			parentID:            "spiffe://parent",
+			expectedList:        allEntries[:2],
+		},
+		{
+			name:                "test_parentID_notfound",
+			registrationEntries: allEntries,
+			parentID:            "spiffe://imnoparent",
+			expectedList:        nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ds, cleanup := newDS()
+			defer cleanup()
+
+			for _, entry := range tt.registrationEntries {
+				created, err := ds.CreateRegistrationEntry(ctx, entry)
+				require.NoError(t, err)
+				entry.EntryId = created.EntryId
+			}
+
+			result, err := ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+				ByParentID: tt.parentID,
+			})
+			require.NoError(t, err)
+
+			assertCreatedAtFields(t, result, now)
+			spiretest.RequireProtoListEqual(t, tt.expectedList, result.Entries)
+		})
+	}
+}
+
+func assertCreatedAtFields(t *testing.T, resp *datastore.ListRegistrationEntriesResponse, since int64) {
+	t.Helper()
+	for _, entry := range resp.Entries {
+		assertCreatedAtField(t, entry, since)
+	}
+}
+
+func TestListSelectorEntries(
+	t *testing.T,
+	newDS func() (datastore.DataStore, func()),
+	loadEntries func(path string, out *[]*common.RegistrationEntry),
+) {
+	t.Helper()
+	ctx := context.Background()
+
+	now := time.Now().Unix()
+	allEntries := make([]*common.RegistrationEntry, 0)
+	loadEntries(filepath.Join("testdata", "entries.json"), &allEntries)
+
+	tests := []struct {
+		name                string
+		registrationEntries []*common.RegistrationEntry
+		selectors           []*common.Selector
+		expectedList        []*common.RegistrationEntry
+	}{
+		{
+			name:                "entries_by_selector_found",
+			registrationEntries: allEntries,
+			selectors: []*common.Selector{
+				{Type: "a", Value: "1"},
+				{Type: "b", Value: "2"},
+				{Type: "c", Value: "3"},
+			},
+			expectedList: []*common.RegistrationEntry{allEntries[0]},
+		},
+		{
+			name:                "entries_by_selector_not_found",
+			registrationEntries: allEntries,
+			selectors: []*common.Selector{
+				{Type: "e", Value: "0"},
+			},
+			expectedList: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ds, cleanup := newDS()
+			defer cleanup()
+
+			for _, entry := range tt.registrationEntries {
+				created, err := ds.CreateRegistrationEntry(ctx, entry)
+				require.NoError(t, err)
+				entry.EntryId = created.EntryId
+			}
+
+			result, err := ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+				BySelectors: &datastore.BySelectors{
+					Selectors: tt.selectors,
+					Match:     datastore.Exact,
+				},
+			})
+			require.NoError(t, err)
+
+			assertCreatedAtFields(t, result, now)
+			spiretest.RequireProtoListEqual(t, tt.expectedList, result.Entries)
+		})
+	}
+}
+
+func TestListEntriesBySelectorSubset(
+	t *testing.T,
+	newDS func() (datastore.DataStore, func()),
+	loadEntries func(path string, out *[]*common.RegistrationEntry),
+) {
+	t.Helper()
+	ctx := context.Background()
+
+	now := time.Now().Unix()
+	allEntries := make([]*common.RegistrationEntry, 0)
+	loadEntries(filepath.Join("testdata", "entries.json"), &allEntries)
+
+	tests := []struct {
+		name                string
+		registrationEntries []*common.RegistrationEntry
+		selectors           []*common.Selector
+		expectedList        []*common.RegistrationEntry
+	}{
+		{
+			name:                "test1",
+			registrationEntries: allEntries,
+			selectors: []*common.Selector{
+				{Type: "a", Value: "1"},
+				{Type: "b", Value: "2"},
+				{Type: "c", Value: "3"},
+			},
+			expectedList: []*common.RegistrationEntry{
+				allEntries[0],
+				allEntries[1],
+				allEntries[2],
+			},
+		},
+		{
+			name:                "test2",
+			registrationEntries: allEntries,
+			selectors: []*common.Selector{
+				{Type: "d", Value: "4"},
+			},
+			expectedList: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ds, cleanup := newDS()
+			defer cleanup()
+
+			for _, entry := range tt.registrationEntries {
+				created, err := ds.CreateRegistrationEntry(ctx, entry)
+				require.NoError(t, err)
+				require.NotNil(t, created)
+				entry.EntryId = created.EntryId
+			}
+
+			result, err := ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+				BySelectors: &datastore.BySelectors{
+					Selectors: tt.selectors,
+					Match:     datastore.Subset,
+				},
+			})
+			require.NoError(t, err)
+
+			// sort both lists for deterministic comparison
+			if tt.expectedList != nil {
+				util.SortRegistrationEntries(tt.expectedList)
+			}
+			util.SortRegistrationEntries(result.Entries)
+
+			assertCreatedAtFields(t, result, now)
+			spiretest.RequireProtoListEqual(t, tt.expectedList, result.Entries)
+		})
+	}
+}
+
+func TestListSelectorEntriesSuperset(
+	t *testing.T,
+	newDS func() (datastore.DataStore, func()),
+	allEntries []*common.RegistrationEntry,
+) {
+	t.Helper()
+	ctx := context.Background()
+
+	now := time.Now().Unix()
+
+	tests := []struct {
+		name                string
+		registrationEntries []*common.RegistrationEntry
+		selectors           []*common.Selector
+		expectedList        []*common.RegistrationEntry
+	}{
+		{
+			name:                "entries_by_selector_found",
+			registrationEntries: allEntries,
+			selectors: []*common.Selector{
+				{Type: "a", Value: "1"},
+				{Type: "c", Value: "3"},
+			},
+			expectedList: []*common.RegistrationEntry{
+				allEntries[0],
+				allEntries[3],
+			},
+		},
+		{
+			name:                "entries_by_selector_not_found",
+			registrationEntries: allEntries,
+			selectors: []*common.Selector{
+				{Type: "e", Value: "0"},
+			},
+			expectedList: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ds, cleanup := newDS()
+			defer cleanup()
+
+			for _, entry := range tt.registrationEntries {
+				created, err := ds.CreateRegistrationEntry(ctx, entry)
+				require.NoError(t, err)
+				require.NotNil(t, created)
+				entry.EntryId = created.EntryId
+			}
+
+			result, err := ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+				BySelectors: &datastore.BySelectors{
+					Selectors: tt.selectors,
+					Match:     datastore.Superset,
+				},
+			})
+			require.NoError(t, err)
+
+			// Uses your existing helper defined in the new tests
+			assertCreatedAtFields(t, result, now)
+
+			spiretest.RequireProtoListEqual(t, tt.expectedList, result.Entries)
+		})
+	}
 }

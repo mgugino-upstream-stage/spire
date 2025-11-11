@@ -3,9 +3,12 @@ package sqlstore
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"testing"
 
 	"github.com/spiffe/spire/pkg/server/datastore"
 	dstest "github.com/spiffe/spire/pkg/server/datastore/test"
+	"github.com/spiffe/spire/proto/spire/common"
 	"google.golang.org/grpc/codes"
 )
 
@@ -170,6 +173,135 @@ func (s *PluginSuite) TestDeleteFederationRelationship() {
 }
 
 // Having replicated yet
+
+func (s *PluginSuite) TestListSelectorEntriesSuperset() {
+	// Prepare the static test data once here
+	allEntries := make([]*common.RegistrationEntry, 0)
+	s.getTestDataFromJSONFile(filepath.Join("testdata", "entries.json"), &allEntries)
+
+	// newDS: returns a fresh datastore and a cleanup that calls Close()
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		return ds, func() { ds.Close() }
+	}
+
+	dstest.TestListSelectorEntriesSuperset(s.T(), newDS, allEntries)
+}
+
+func (s *PluginSuite) TestListEntriesBySelectorSubset() {
+	// newDS: returns a fresh datastore, with Close() handled by the returned cleanup func
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		cleanup := func() { ds.Close() }
+		return ds, cleanup
+	}
+
+	// loadEntries: adapt s.getTestDataFromJSONFile(path string, any) to the expected signature
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
+
+	dstest.TestListEntriesBySelectorSubset(
+		s.T(),
+		newDS,
+		loadEntries,
+	)
+}
+
+func (s *PluginSuite) TestListSelectorEntries() {
+	// newDS: returns a fresh datastore and a cleanup that closes it
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		cleanup := func() { ds.Close() }
+		return ds, cleanup
+	}
+
+	// loadEntries adapts s.getTestDataFromJSONFile(path string, jsonValue any)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries)
+		*out = entries
+	}
+
+	dstest.TestListSelectorEntries(
+		s.T(),
+		newDS,
+		loadEntries,
+	)
+}
+
+func (s *PluginSuite) TestListParentIDEntries() {
+	// newDS: returns a fresh datastore, with Close() hidden inside t.Cleanup
+	newDS := func() (datastore.DataStore, func()) {
+		ds := s.newPlugin()
+		cleanup := func() { ds.Close() }
+		return ds, cleanup
+	}
+
+	// loadEntries: adapt s.getTestDataFromJSONFile(path string, jsonValue any)
+	// to the signature the shared test expects: func(path string, out *[]*common.RegistrationEntry)
+	loadEntries := func(path string, out *[]*common.RegistrationEntry) {
+		var entries []*common.RegistrationEntry
+		s.getTestDataFromJSONFile(path, &entries) // uses "any" param under the hood
+		*out = entries
+	}
+
+	// Delegate to the shared test body
+	dstest.TestListParentIDEntries(
+		s.T(),
+		newDS,       // creates a ds and auto-closes via t.Cleanup
+		loadEntries, // loads testdata/entries.json into []*common.RegistrationEntry
+	)
+}
+
+func (s *PluginSuite) TestPruneRegistrationEntries() {
+	dstest.TestPruneRegistrationEntries(
+		s.T(),
+		s.ds,
+		s.hook, // implements AllEntries() and LastEntry()
+	)
+}
+
+func (s *PluginSuite) TestUpdateRegistrationEntry() {
+	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
+		s.Require().NoError(err)
+		return out
+	}
+	dstest.TestUpdateRegistrationEntry(s.T(), s.ds, create)
+}
+
+func (s *PluginSuite) TestUpdateRegistrationEntryWithStoreSvid() {
+	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
+		s.Require().NoError(err)
+		return out
+	}
+	dstest.TestUpdateRegistrationEntryWithStoreSvid(s.T(), s.ds, create)
+}
+
+func (s *PluginSuite) TestUpdateRegistrationEntryWithMask() {
+	dstest.TestUpdateRegistrationEntryWithMask(
+		s.T(),
+		s.ds,
+		func(td string) { s.createBundle(td) },
+		func(t *testing.T, ds datastore.DataStore, entry *common.RegistrationEntry) *common.RegistrationEntry {
+			return dstest.CreateRegistrationEntry(t, ds, entry)
+		},
+		s.deleteRegistrationEntry,
+	)
+}
+
+func (s *PluginSuite) TestDeleteRegistrationEntry() {
+	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
+		s.Require().NoError(err)
+		return out
+	}
+	dstest.TestDeleteRegistrationEntry(s.T(), s.ds, create)
+}
 
 func (s *PluginSuite) TestListRegistrationEntriesWhenCruftRowsExist() {
 	ctx := context.Background()
