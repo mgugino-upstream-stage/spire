@@ -246,7 +246,6 @@ func (ds *CassandraDataStore) CountAttestedNodes(ctx context.Context, req *datas
 	return int32(count), nil
 }
 
-// ListAttestedNodes lists attested nodes with Cassandra paging (no selector filters in current proto)
 // ListAttestedNodes lists attested nodes using explicit keyset pagination.
 // Token semantics: the request's Pagination.Token is the last returned SPIFFE ID.
 // We page by spiffe_id ASC (within the single-partition table keyed by bucket).
@@ -449,44 +448,6 @@ func (ds *CassandraDataStore) ListAttestedNodes(ctx context.Context, req *datast
 	return out, nil
 }
 
-// matchNodeFilters applies all ListAttestedNodesRequest filters to a node.
-func matchNodeFilters(m AttNodeModel, req *datastore.ListAttestedNodesRequest) bool {
-	// ByExpiresBefore: cert_not_after < ts
-	if !req.ByExpiresBefore.IsZero() {
-		if !(m.CertNotAfter < req.ByExpiresBefore.Unix()) {
-			return false
-		}
-	}
-	// ValidAt: cert_not_after >= ts
-	if !req.ValidAt.IsZero() {
-		if !(m.CertNotAfter >= req.ValidAt.Unix()) {
-			return false
-		}
-	}
-	// ByAttestationType
-	if req.ByAttestationType != "" && req.ByAttestationType != m.AttestationType {
-		return false
-	}
-	// ByBanned: true => serial == "", false => serial != ""
-	if req.ByBanned != nil {
-		banned := m.CertSerialNumber == ""
-		if *req.ByBanned != banned {
-			return false
-		}
-	}
-	// ByCanReattest
-	if req.ByCanReattest != nil && m.CanReattest != *req.ByCanReattest {
-		return false
-	}
-	// BySelectorMatch
-	if req.BySelectorMatch != nil {
-		if !matchSelectors(m.Selectors, req.BySelectorMatch) {
-			return false
-		}
-	}
-	return true
-}
-
 // matchSelectors implements Subset / Superset / Exact / MatchAny against node selectors.
 // The test helpers build selectors with Type == Value (e.g., "S1"), but we match by full pair.
 func matchSelectors(nodeSel []*common.Selector, by *datastore.BySelectors) bool {
@@ -681,7 +642,6 @@ func (ds *CassandraDataStore) ListAttestedNodeEvents(ctx context.Context, req *d
 	}
 	return &datastore.ListAttestedNodeEventsResponse{Events: out}, nil
 
-	return &datastore.ListAttestedNodeEventsResponse{Events: out}, nil
 }
 
 // PruneAttestedNodeEvents deletes attested node events older than the given duration.

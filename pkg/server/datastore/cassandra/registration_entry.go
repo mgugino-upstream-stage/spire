@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	"github.com/spiffe/spire/proto/spire/common"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const registrationEntryEventsBucket = "registered_entry_events"
@@ -298,17 +301,30 @@ func (ds *CassandraDataStore) CountRegistrationEntries(ctx context.Context, req 
 
 // ListRegistrationEntries lists all registrations (pagination available)
 func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *datastore.ListRegistrationEntriesRequest) (*datastore.ListRegistrationEntriesResponse, error) {
-	resp := &datastore.ListRegistrationEntriesResponse{
-		Entries: make([]*common.RegistrationEntry, 0),
+	resp := &datastore.ListRegistrationEntriesResponse{Entries: make([]*common.RegistrationEntry, 0)}
+
+	// Normalize nil request
+	if req == nil {
+		req = &datastore.ListRegistrationEntriesRequest{}
+	}
+
+	// ---- Strict request validation (matches sqlstore tests) ----
+	if req.Pagination != nil && req.Pagination.PageSize == 0 {
+		return nil, status.Error(codes.InvalidArgument, "cannot paginate with pagesize = 0")
+	}
+	if req.BySelectors != nil && len(req.BySelectors.Selectors) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "cannot list by empty selector set")
+	}
+	if req.ByFederatesWith != nil && len(req.ByFederatesWith.TrustDomains) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "cannot list by empty federatesWith set")
 	}
 
 	// ----- Pagination (nil-safe) -----
 	pageSize := int32(50)
 	var pagingState []byte
-	if req != nil && req.Pagination != nil {
-		if req.Pagination.PageSize > 0 {
-			pageSize = req.Pagination.PageSize
-		}
+	if req.Pagination != nil {
+		// PageSize already validated to be > 0
+		pageSize = req.Pagination.PageSize
 		if req.Pagination.Token != "" {
 			pagingState = []byte(req.Pagination.Token)
 		}
@@ -816,6 +832,13 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 		if err != nil {
 			return nil, err
 		}
+		// Ensure deterministic order to match sqlstore expectations
+		sort.Slice(selectors, func(i, j int) bool {
+			if selectors[i].Type == selectors[j].Type {
+				return selectors[i].Value < selectors[j].Value
+			}
+			return selectors[i].Type < selectors[j].Type
+		})
 
 		dnsNames, err := ds.fetchDNSNamesByEntryID(ctx, m.EntryID)
 		if err != nil {
@@ -839,11 +862,11 @@ func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *
 			SpiffeId:       m.SpiffeID,
 			ParentId:       m.ParentID,
 			X509SvidTtl:    m.X509SvidTtl,
-			FederatesWith:  federatesWith, // now nil when empty
+			FederatesWith:  federatesWith,
 			Admin:          m.Admin,
 			Downstream:     m.Downstream,
 			EntryExpiry:    m.Expiry,
-			DnsNames:       dnsNames, // now nil when empty
+			DnsNames:       dnsNames,
 			RevisionNumber: m.RevisionNumber,
 			StoreSvid:      m.StoreSvid,
 			JwtSvidTtl:     m.JwtSvidTtl,
@@ -892,7 +915,7 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		return nil, newError("invalid request: missing registration entry ID")
 	}
 
-	// Default: update all fields when mask is nil (matches sqlstore tests)
+	// Default: update all fields when mask is nil (matches SQLStore tests)
 	if mask == nil {
 		mask = &common.RegistrationEntryMask{
 			Selectors:     true,
@@ -910,7 +933,48 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		}
 	}
 
-	// Fetch existing (ensures the row exists and gives us CreatedAt, etc.)
+	// -------------------------------
+	// Validation (final tuned behavior for all test suites)
+	// -------------------------------
+	if mask.SpiffeId {
+		if e.SpiffeId == "" {
+			return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: missing SPIFFE ID")
+		}
+	}
+
+	// Only fail if explicitly invalid (negative), not when zero/unspecified
+	if mask.X509SvidTtl {
+		if e.X509SvidTtl < 0 {
+			return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: X509SvidTtl is not set")
+		}
+	}
+
+	if mask.JwtSvidTtl {
+		if e.JwtSvidTtl < 0 {
+			return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: JwtSvidTtl is not set")
+		}
+	}
+
+	if mask.Selectors {
+		if len(e.Selectors) == 0 {
+			return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: missing selector list")
+		}
+	}
+
+	if mask.StoreSvid && e.StoreSvid {
+		// When StoreSVID is enabled, all selector types must be the same
+		if len(e.Selectors) > 1 {
+			firstType := e.Selectors[0].Type
+			for _, s := range e.Selectors[1:] {
+				if s.Type != firstType {
+					return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: selector types must be the same when store SVID is enabled")
+				}
+			}
+		}
+	}
+	// -------------------------------
+
+	// Fetch existing entry
 	existingEntry, err := ds.FetchRegistrationEntry(ctx, e.EntryId)
 	if err != nil {
 		return nil, err
@@ -919,7 +983,7 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		return nil, newNotFoundError("datastore-sql: record not found: %s", e.EntryId)
 	}
 
-	// If FederatesWith is changing, validate referenced bundles exist
+	// Validate FederatesWith bundles if changed
 	if mask.FederatesWith && len(e.FederatesWith) > 0 {
 		for _, td := range e.FederatesWith {
 			var count int64
@@ -933,8 +997,7 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		}
 	}
 
-	// Collect base-table updates using an explicit new revision (no counter ops)
-	// Cassandra only permits "+ 1" on counter columns; revision_number is bigint.
+	// Revision bump
 	var currentRev int64
 	var createdAt time.Time
 	const selQ = `SELECT revision_number, created_at FROM registered_entries WHERE entry_id = ?`
@@ -991,14 +1054,14 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 	setClauses = append(setClauses, "revision_number = ?", "updated_at = ?")
 	args = append(args, newRev, now)
 
-	// Apply the UPDATE if there is anything to set (there always is due to rev/updated_at)
+	// Update registered_entries
 	query := "UPDATE registered_entries SET " + strings.Join(setClauses, ", ") + " WHERE entry_id = ?"
 	args = append(args, e.EntryId)
 	if err := ds.session.Query(query, args...).Exec(); err != nil {
 		return nil, newError("failed to update registration entry: %v", err)
 	}
 
-	// Update collection-style tables according to mask
+	// Update related tables based on mask
 	if mask.Selectors {
 		if err := ds.deleteSelectorsByEntryID(e.EntryId); err != nil {
 			return nil, err
@@ -1024,12 +1087,12 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		}
 	}
 
-	// Emit update event
+	// Emit event
 	if err := ds.createRegistrationEntryEventForEntryID(e.EntryId); err != nil {
 		return nil, newError("failed to create registration entry event: %v", err)
 	}
 
-	// Return fresh copy
+	// Return updated object
 	updatedEntry, err := ds.FetchRegistrationEntry(ctx, e.EntryId)
 	if err != nil {
 		return nil, err
@@ -1037,7 +1100,7 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 	return updatedEntry, nil
 }
 
-// DeleteRegistrationEntry deletes the given registration
+// DeleteRegistrationEntry deletes the given registration entry
 func (ds *CassandraDataStore) DeleteRegistrationEntry(ctx context.Context, entryID string) (*common.RegistrationEntry, error) {
 	// First fetch the entry to return it
 	existingEntry, err := ds.FetchRegistrationEntry(ctx, entryID)
@@ -1046,7 +1109,7 @@ func (ds *CassandraDataStore) DeleteRegistrationEntry(ctx context.Context, entry
 	}
 
 	if existingEntry == nil {
-		return nil, nil // Entry doesn't exist, nothing to delete
+		return nil, newNotFoundError("record not found: %s", entryID)
 	}
 
 	// Delete related data first
@@ -1060,13 +1123,13 @@ func (ds *CassandraDataStore) DeleteRegistrationEntry(ctx context.Context, entry
 		return nil, err
 	}
 
-	// Delete the entry
-	deleteQuery := `DELETE FROM registered_entries WHERE entry_id = ?`
-	if err := ds.session.Query(deleteQuery, entryID).Exec(); err != nil {
+	// Delete the entry itself
+	const deleteQ = `DELETE FROM registered_entries WHERE entry_id = ?`
+	if err := ds.session.Query(deleteQ, entryID).Exec(); err != nil {
 		return nil, newError("failed to delete registration entry: %v", err)
 	}
 
-	// Create a registration entry event
+	// Emit a deletion event for auditability
 	if err := ds.createRegistrationEntryEventForEntryID(entryID); err != nil {
 		return nil, newError("failed to create registration entry event: %v", err)
 	}

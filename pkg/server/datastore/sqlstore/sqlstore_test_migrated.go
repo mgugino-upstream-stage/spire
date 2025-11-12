@@ -171,8 +171,6 @@ func (s *PluginSuite) TestDeleteFederationRelationship() {
 	dstest.TestDeleteFederationRelationship(s.T(), s.ds)
 }
 
-// Haven't replicated yet
-
 // SQL wrapper (keeps your method name; just delegates to the stand-alone test with a fresh DS)
 func (s *PluginSuite) TestPruneRegistrationEntryEvents() {
 	newDS := func() (datastore.DataStore, func()) {
@@ -187,6 +185,7 @@ func (s *PluginSuite) TestPruneRegistrationEntryEvents() {
 	dstest.TestPruneRegistrationEntryEvents(s.T(), ds)
 }
 
+// Haven't replicated yet
 func (s *PluginSuite) TestListRegistrationEntryEvents() {
 	// Delegate to the shared standalone test (no extra callbacks needed).
 	dstest.TestListRegistrationEntryEvents(s.T(), s.ds)
@@ -424,37 +423,6 @@ func (s *PluginSuite) TestDeleteRegistrationEntry() {
 	dstest.TestDeleteRegistrationEntry(s.T(), s.ds, create)
 }
 
-func (s *PluginSuite) TestListRegistrationEntriesWhenCruftRowsExist() {
-	ctx := context.Background()
-
-	// Wrap into shared helper; rawDeleteBaseAll reproduces the original direct DELETE:
-	rawDeleteBaseAll := func() error {
-		// This matches your original direct exec against "registered_entries".
-		// We preserve the rows-affected check by converting it into an error on mismatch.
-		res, err := s.ds.db.raw.Exec("DELETE FROM registered_entries")
-		if err != nil {
-			return err
-		}
-		rowsAffected, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if rowsAffected != 1 {
-			return fmt.Errorf("expected to delete 1 row from registered_entries, deleted %d", rowsAffected)
-		}
-		return nil
-	}
-
-	// Seed + verify via shared test (keeps business logic identical)
-	dstest.TestListRegistrationEntriesWhenCruftRowsExist(s.T(), s.ds, rawDeleteBaseAll)
-
-	// No extra assertions needed; the shared test performs the final list check:
-	// resp, err := s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{})
-	// s.Require().NoError(err)
-	// s.Require().Empty(resp.Entries)
-	_ = ctx // preserve original local variable; avoid unused warning if build tags differ
-}
-
 func (s *PluginSuite) TestListRegistrationEntries() {
 	ctx := context.Background()
 	// Connection is never used, each test creates new connection to a different database
@@ -533,4 +501,37 @@ func (s *PluginSuite) TestFetchRegistrationEntryDoesNotExist() {
 
 func (s *PluginSuite) TestFetchRegistrationEntries() {
 	dstest.TestFetchRegistrationEntries(s.T(), s.ds)
+}
+
+// Tests go fix for cassandra later:
+
+func (s *PluginSuite) TestListRegistrationEntriesWhenCruftRowsExist() {
+	ctx := context.Background()
+
+	// Wrap into shared helper; rawDeleteBaseAll reproduces the original direct DELETE:
+	rawDeleteBaseAll := func() error {
+		// This matches your original direct exec against "registered_entries".
+		// We preserve the rows-affected check by converting it into an error on mismatch.
+		res, err := s.ds.db.raw.Exec("DELETE FROM registered_entries")
+		if err != nil {
+			return err
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected != 1 {
+			return fmt.Errorf("expected to delete 1 row from registered_entries, deleted %d", rowsAffected)
+		}
+		return nil
+	}
+
+	// Seed + verify via shared test (keeps business logic identical)
+	dstest.TestListRegistrationEntriesWhenCruftRowsExist(s.T(), s.ds, rawDeleteBaseAll)
+
+	// No extra assertions needed; the shared test performs the final list check:
+	// resp, err := s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{})
+	// s.Require().NoError(err)
+	// s.Require().Empty(resp.Entries)
+	_ = ctx // preserve original local variable; avoid unused warning if build tags differ
 }

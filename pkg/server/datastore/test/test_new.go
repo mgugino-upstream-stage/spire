@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -502,6 +503,15 @@ func TestUpdateRegistrationEntryWithMask(
 			spiretest.RequireProtoEqual(t, expectedResult, registrationEntry)
 		})
 	}
+}
+
+func sortSelectors(ss []*common.Selector) {
+	sort.Slice(ss, func(i, j int) bool {
+		if ss[i].Type != ss[j].Type {
+			return ss[i].Type < ss[j].Type
+		}
+		return ss[i].Value < ss[j].Value
+	})
 }
 
 func TestDeleteRegistrationEntry(

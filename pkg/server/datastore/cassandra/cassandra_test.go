@@ -12,12 +12,14 @@ import (
 
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	dstest "github.com/spiffe/spire/pkg/server/datastore/test"
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/clock"
 	"github.com/spiffe/spire/test/spiretest"
 	testutil "github.com/spiffe/spire/test/util"
+	"google.golang.org/grpc/codes"
 )
 
 const (
@@ -253,6 +255,17 @@ func (s *PluginSuite) truncateAllTables() error {
 	return nil
 }
 
+func (s *PluginSuite) createBundle(trustDomainID string) *common.Bundle {
+	bundle, err := s.ds.CreateBundle(ctx, bundleutil.BundleProtoFromRootCA(trustDomainID, s.cert))
+	s.Require().NoError(err)
+	return bundle
+}
+
+func (s *PluginSuite) deleteRegistrationEntry(entryID string) {
+	_, err := s.ds.DeleteRegistrationEntry(ctx, entryID)
+	s.Require().NoError(err)
+}
+
 func (s *PluginSuite) getTestDataFromJSONFile(filePath string, jsonValue any) {
 	entriesJSON, err := os.ReadFile(filePath)
 	s.Require().NoError(err)
@@ -408,8 +421,8 @@ func (s *PluginSuite) getTestDataFromJSONFile(filePath string, jsonValue any) {
 		rawCreate := func(raw dstest.FederatedTrustDomainRaw) error {
 			return s.ds.session.Query(
 				`INSERT INTO federation_relationships
-						 (bucket, trust_domain, bundle_endpoint_url, bundle_endpoint_profile, endpoint_spiffe_id, created_at, updated_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+							 (bucket, trust_domain, bundle_endpoint_url, bundle_endpoint_profile, endpoint_spiffe_id, created_at, updated_at)
+							 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 				federationBucket,
 				raw.TrustDomain,
 				raw.BundleEndpointURL,
@@ -468,7 +481,6 @@ func (s *PluginSuite) getTestDataFromJSONFile(filePath string, jsonValue any) {
 		dstest.TestDeleteBundleDissociateRegistrationEntries(s.T(), s.ds, s.cert)
 	}
 
-
 	func (s *PluginSuite) TestPruneRegistrationEntryEvents() {
 		newDS := func() (datastore.DataStore, func()) {
 			s.truncateAllTables()
@@ -481,13 +493,11 @@ func (s *PluginSuite) getTestDataFromJSONFile(filePath string, jsonValue any) {
 		// Run the migrated test against a fresh datastore so EventIDs start at 1
 		dstest.TestPruneRegistrationEntryEvents(s.T(), ds)
 	}
-
+*/
 func (s *PluginSuite) TestListRegistrationEntryEvents() {
 	// Delegate to the shared standalone test (no extra callbacks needed).
 	dstest.TestListRegistrationEntryEvents(s.T(), s.ds)
 }
-
-
 
 func (s *PluginSuite) TestListEntriesBySelectorMatchAny() {
 	// newDS: returns a fresh datastore and a cleanup that closes it
@@ -558,8 +568,6 @@ func (s *PluginSuite) TestListEntriesByFederatesWithMatchAny() {
 		loadEntries,
 	)
 }
-*/
-// WIP:
 
 func (s *PluginSuite) TestListEntriesByFederatesWithSubset() {
 	// newDS: returns a fresh datastore, with Close() encapsulated in the cleanup func
@@ -703,4 +711,70 @@ func (s *PluginSuite) TestPruneRegistrationEntries() {
 		s.ds,
 		s.hook, // implements AllEntries() and LastEntry()
 	)
+}
+
+func (s *PluginSuite) TestUpdateRegistrationEntryWithStoreSvid() {
+	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
+		s.Require().NoError(err)
+		return out
+	}
+	dstest.TestUpdateRegistrationEntryWithStoreSvid(s.T(), s.ds, create)
+}
+
+func (s *PluginSuite) TestUpdateRegistrationEntryWithMask() {
+	dstest.TestUpdateRegistrationEntryWithMask(
+		s.T(),
+		s.ds,
+		func(td string) { s.createBundle(td) },
+		func(t *testing.T, ds datastore.DataStore, entry *common.RegistrationEntry) *common.RegistrationEntry {
+			return dstest.CreateRegistrationEntry(t, ds, entry)
+		},
+		s.deleteRegistrationEntry,
+	)
+}
+
+func (s *PluginSuite) TestDeleteRegistrationEntry() {
+	create := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		out, err := s.ds.CreateRegistrationEntry(context.Background(), e)
+		s.Require().NoError(err)
+		return out
+	}
+	dstest.TestDeleteRegistrationEntry(s.T(), s.ds, create)
+}
+
+func (s *PluginSuite) TestListRegistrationEntries() {
+	ctx := context.Background()
+
+	newDS := func() datastore.DataStore {
+		ds := s.ds
+		s.truncateAllTables()
+		return ds
+	}
+
+	// Delegate to shared dstest implementation which accepts a newDS factory
+	dstest.TestListRegistrationEntriesNoSQL(s.T(), newDS, s.cert, s.cacert)
+
+	resp, err := s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+		Pagination: &datastore.Pagination{
+			PageSize: 0,
+		},
+	})
+	s.RequireGRPCStatus(err, codes.InvalidArgument, "cannot paginate with pagesize = 0")
+	s.Require().Nil(resp)
+
+	resp, err = s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+		Pagination: &datastore.Pagination{
+			Token:    "invalid int",
+			PageSize: 10,
+		},
+	})
+	s.Require().Error(err, "could not parse token 'invalid int'")
+	s.Require().Nil(resp)
+
+	resp, err = s.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
+		BySelectors: &datastore.BySelectors{},
+	})
+	s.RequireGRPCStatus(err, codes.InvalidArgument, "cannot list by empty selector set")
+	s.Require().Nil(resp)
 }
