@@ -3,8 +3,6 @@ package cassandra
 import (
 	"context"
 	"errors"
-	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -18,44 +16,42 @@ import (
 )
 
 const registrationEntryEventsBucket = "registered_entry_events"
+const regEntriesBucket = "registered_entries"
 
-// CreateRegistrationEntry stores the given registration entry
+// CreateRegistrationEntry stores the given registration entry (with secondary indexes).
 func (ds *CassandraDataStore) CreateRegistrationEntry(ctx context.Context, entry *common.RegistrationEntry) (*common.RegistrationEntry, error) {
 	if entry == nil {
 		return nil, newError("invalid request: missing registration entry")
 	}
 
-	// Validate that all federated bundles exist (matches sqlstore behavior)
+	// Validate federated bundles exist (sqlstore behavior)
 	if len(entry.FederatesWith) > 0 {
 		for _, td := range entry.FederatesWith {
 			var count int64
-			// Full primary key provided (bucket, trust_domain) => efficient, no ALLOW FILTERING.
 			const q = `SELECT COUNT(*) FROM bundles WHERE bucket = ? AND trust_domain = ?`
 			if err := ds.session.Query(q, bundleBucket, td).Scan(&count); err != nil {
 				return nil, newError("failed to check federated bundle existence: %v", err)
 			}
 			if count == 0 {
-				// Exact wording expected by the test:
 				return nil, newError(`unable to find federated bundle %q`, td)
 			}
 		}
 	}
 
-	// Generate entry ID if not provided
+	// ID
 	entryID := entry.EntryId
 	if entryID == "" {
 		entryID = gocql.TimeUUID().String()
 	}
 
-	// Insert the registration entry
-	const insertEntryQuery = `
+	const insertEntry = `
 		INSERT INTO registered_entries (
 			entry_id, spiffe_id, parent_id, x509_svid_ttl, admin, downstream, expiry,
 			store_svid, hint, jwt_svid_ttl, revision_number, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-
 	now := time.Now()
-	if err := ds.session.Query(insertEntryQuery,
+
+	if err := ds.session.Query(insertEntry,
 		entryID,
 		entry.SpiffeId,
 		entry.ParentId,
@@ -67,48 +63,44 @@ func (ds *CassandraDataStore) CreateRegistrationEntry(ctx context.Context, entry
 		entry.Hint,
 		entry.JwtSvidTtl,
 		entry.RevisionNumber,
-		now,
-		now,
+		now, now,
 	).Exec(); err != nil {
 		return nil, newError("failed to create registration entry: %v", err)
 	}
 
-	// Insert selectors
+	// Secondary/child tables
 	if len(entry.Selectors) > 0 {
-		const insertSelectorQuery = `INSERT INTO selectors (entry_id, selector_type, selector_value) VALUES (?, ?, ?)`
-		for _, selector := range entry.Selectors {
-			if err := ds.session.Query(insertSelectorQuery, entryID, selector.Type, selector.Value).Exec(); err != nil {
-				return nil, newError("failed to insert selector: %v", err)
-			}
+		if err := ds.insertSelectors(entryID, entry.Selectors); err != nil {
+			return nil, err
+		}
+		if err := ds.insertRegSelectorsIndex(entryID, entry.Selectors); err != nil {
+			return nil, err
 		}
 	}
-
-	// Insert DNS names
 	if len(entry.DnsNames) > 0 {
-		const insertDNSQuery = `INSERT INTO dns_names (entry_id, dns_name) VALUES (?, ?)`
-		for _, dnsName := range entry.DnsNames {
-			if err := ds.session.Query(insertDNSQuery, entryID, dnsName).Exec(); err != nil {
-				return nil, newError("failed to insert DNS name: %v", err)
-			}
+		if err := ds.insertDNSNames(entryID, entry.DnsNames); err != nil {
+			return nil, err
 		}
 	}
-
-	// Insert federates_with relationships
 	if len(entry.FederatesWith) > 0 {
-		const insertFederatesQuery = `INSERT INTO federates_with (entry_id, trust_domain) VALUES (?, ?)`
-		for _, trustDomain := range entry.FederatesWith {
-			if err := ds.session.Query(insertFederatesQuery, entryID, trustDomain).Exec(); err != nil {
-				return nil, newError("failed to insert federates_with: %v", err)
-			}
+		if err := ds.insertFederatesWith(entryID, entry.FederatesWith); err != nil {
+			return nil, err
+		}
+		if err := ds.insertFederatesWithIndex(entryID, entry.FederatesWith); err != nil {
+			return nil, err
 		}
 	}
 
-	// Create a registration entry event
+	// Scan index of all IDs (bucketed for paging without illegal ORDER BY)
+	if err := ds.insertRegAllIDs(entryID); err != nil {
+		return nil, err
+	}
+
+	// Event
 	if err := ds.createRegistrationEntryEventForEntryID(entryID); err != nil {
 		return nil, newError("failed to create registration entry event: %v", err)
 	}
 
-	// Return the entry with the computed entry ID
 	return &common.RegistrationEntry{
 		EntryId:        entryID,
 		Selectors:      entry.Selectors,
@@ -299,614 +291,348 @@ func (ds *CassandraDataStore) CountRegistrationEntries(ctx context.Context, req 
 	return int32(count), nil
 }
 
-// ListRegistrationEntries lists all registrations (pagination available)
+// ListRegistrationEntries lists entries with explicit keyset pagination (entry_id) using indexes.
+// Uses union/AND logic over reg_selectors_index and federates_with_index; falls back to registered_entries_scan.
 func (ds *CassandraDataStore) ListRegistrationEntries(ctx context.Context, req *datastore.ListRegistrationEntriesRequest) (*datastore.ListRegistrationEntriesResponse, error) {
-	resp := &datastore.ListRegistrationEntriesResponse{Entries: make([]*common.RegistrationEntry, 0)}
+	const defaultPage = 50
 
-	// Normalize nil request
-	if req == nil {
-		req = &datastore.ListRegistrationEntriesRequest{}
-	}
-
-	// ---- Strict request validation (matches sqlstore tests) ----
-	if req.Pagination != nil && req.Pagination.PageSize == 0 {
+	// Enforce "pagesize = 0" error (tests expect InvalidArgument)
+	if req != nil && req.Pagination != nil && req.Pagination.PageSize == 0 {
 		return nil, status.Error(codes.InvalidArgument, "cannot paginate with pagesize = 0")
 	}
-	if req.BySelectors != nil && len(req.BySelectors.Selectors) == 0 {
+
+	pageSize := getPageSize(req.Pagination, defaultPage)
+	startAfter := ""
+	if req != nil && req.Pagination != nil && req.Pagination.Token != "" {
+		startAfter = req.Pagination.Token
+	}
+
+	// Validate "empty filter" semantics (tests expect InvalidArgument)
+	if req != nil && req.BySelectors != nil && len(req.BySelectors.Selectors) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "cannot list by empty selector set")
 	}
-	if req.ByFederatesWith != nil && len(req.ByFederatesWith.TrustDomains) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "cannot list by empty federatesWith set")
+	if req != nil && req.ByFederatesWith != nil && len(req.ByFederatesWith.TrustDomains) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "cannot list by empty federates_with set")
 	}
 
-	// ----- Pagination (nil-safe) -----
-	pageSize := int32(50)
-	var pagingState []byte
-	if req.Pagination != nil {
-		// PageSize already validated to be > 0
-		pageSize = req.Pagination.PageSize
-		if req.Pagination.Token != "" {
-			pagingState = []byte(req.Pagination.Token)
+	resp := &datastore.ListRegistrationEntriesResponse{
+		Entries: make([]*common.RegistrationEntry, 0, pageSize),
+	}
+
+	type cand struct{ id string }
+
+	// ------- Candidate sources (no full table scans / no illegal ORDER BY) -------
+	// Helpers to page through index tables by entry_id > startAfter, ASC.
+	readRegSelectorsIndex := func(sel *common.Selector, after string, limit int) ([]string, error) {
+		args := []any{sel.Type, sel.Value}
+		q := `SELECT entry_id FROM reg_selectors_index WHERE selector_type = ? AND selector_value = ?`
+		if after != "" {
+			q += ` AND entry_id > ?`
+			args = append(args, after)
 		}
-	}
-
-	// We’ll build a list of entry_ids to restrict the main query.
-	var restrictToEntryIDs []string
-	keys := func(m map[string]struct{}) []string {
-		out := make([]string, 0, len(m))
-		for k := range m {
-			out = append(out, k)
+		q += ` ORDER BY entry_id ASC LIMIT ?`
+		args = append(args, limit)
+		iter := ds.session.Query(q, args...).Iter()
+		var v string
+		var out []string
+		for iter.Scan(&v) {
+			out = append(out, v)
 		}
-		return out
+		if err := iter.Close(); err != nil {
+			return nil, newError("failed to iterate reg_selectors_index: %v", err)
+		}
+		return out, nil
+	}
+	readFederatesIndex := func(td, after string, limit int) ([]string, error) {
+		args := []any{td}
+		q := `SELECT entry_id FROM federates_with_index WHERE trust_domain = ?`
+		if after != "" {
+			q += ` AND entry_id > ?`
+			args = append(args, after)
+		}
+		q += ` ORDER BY entry_id ASC LIMIT ?`
+		args = append(args, limit)
+		iter := ds.session.Query(q, args...).Iter()
+		var v string
+		var out []string
+		for iter.Scan(&v) {
+			out = append(out, v)
+		}
+		if err := iter.Close(); err != nil {
+			return nil, newError("failed to iterate federates_with_index: %v", err)
+		}
+		return out, nil
+	}
+	readAllIDs := func(after string, limit int) ([]string, error) {
+		args := []any{regAllIDsBucket}
+		q := `SELECT entry_id FROM registered_entries_scan WHERE bucket = ?`
+		if after != "" {
+			q += ` AND entry_id > ?`
+			args = append(args, after)
+		}
+		q += ` ORDER BY entry_id ASC LIMIT ?`
+		args = append(args, limit)
+		iter := ds.session.Query(q, args...).Iter()
+		var v string
+		var out []string
+		for iter.Scan(&v) {
+			out = append(out, v)
+		}
+		if err := iter.Close(); err != nil {
+			return nil, newError("failed to iterate registered_entries_scan: %v", err)
+		}
+		return out, nil
 	}
 
-	// =========================
-	// BySelectors filter block
-	// =========================
-	var selectorIDSet map[string]struct{}
-	if req != nil && req.BySelectors != nil && len(req.BySelectors.Selectors) > 0 {
-		const selQ = `SELECT entry_id FROM selectors WHERE selector_type = ? AND selector_value = ? ALLOW FILTERING`
+	// Batch factor to over-fetch, since we filter after hydration
+	const batchFactor = 4
+	scanCursor := startAfter
+	collected := 0
+	var nextToken string
 
-		switch req.BySelectors.Match {
-		case datastore.MatchAny:
-			// union of entry_ids that have ANY of the selectors
-			union := make(map[string]struct{})
-			for _, s := range req.BySelectors.Selectors {
-				if s == nil {
-					continue
-				}
-				iter := ds.session.Query(selQ, s.Type, s.Value).Iter()
-				var id string
-				for iter.Scan(&id) {
-					union[id] = struct{}{}
-				}
-				if err := iter.Close(); err != nil {
-					return nil, newError("failed to query selectors: %v", err)
-				}
-			}
-			if len(union) == 0 {
-				return resp, nil
-			}
-			selectorIDSet = union
+	for collected < pageSize {
+		var candidateIDs []string
 
-		case datastore.Superset:
-			// intersection: entries must contain ALL requested selectors (extras allowed)
-			var inter map[string]struct{}
-			for i, s := range req.BySelectors.Selectors {
-				if s == nil {
-					continue
-				}
-				iter := ds.session.Query(selQ, s.Type, s.Value).Iter()
-				cur := make(map[string]struct{})
-				var id string
-				for iter.Scan(&id) {
-					cur[id] = struct{}{}
-				}
-				if err := iter.Close(); err != nil {
-					return nil, newError("failed to query selectors: %v", err)
-				}
-				if i == 0 || inter == nil {
-					inter = cur
-				} else {
-					for k := range inter {
-						if _, ok := cur[k]; !ok {
-							delete(inter, k)
-						}
-					}
-				}
-				if len(inter) == 0 {
-					return resp, nil
-				}
-			}
-			selectorIDSet = inter
-
-		case datastore.Subset:
-			// entries whose selector set is a SUBSET of the requested set
-			// approach: union candidates, then verify each candidate's full selector set ⊆ requested
-			reqSet := make(map[string]struct{}, len(req.BySelectors.Selectors))
-			for _, s := range req.BySelectors.Selectors {
-				if s == nil {
-					continue
-				}
-				reqSet[s.Type+"|"+s.Value] = struct{}{}
-			}
-			// union candidates
-			candidates := make(map[string]struct{})
-			for _, s := range req.BySelectors.Selectors {
-				if s == nil {
-					continue
-				}
-				iter := ds.session.Query(selQ, s.Type, s.Value).Iter()
-				var id string
-				for iter.Scan(&id) {
-					candidates[id] = struct{}{}
-				}
-				if err := iter.Close(); err != nil {
-					return nil, newError("failed to query selectors: %v", err)
-				}
-			}
-			if len(candidates) == 0 {
-				return resp, nil
-			}
-
-			// verify subset for each candidate
-			valid := make(map[string]struct{})
-			for id := range candidates {
-				full, err := ds.fetchSelectorsByEntryID(ctx, id)
+		switch {
+		// Prefer selector index when provided
+		case req != nil && req.BySelectors != nil && len(req.BySelectors.Selectors) > 0:
+			bs := req.BySelectors
+			switch bs.Match {
+			case datastore.Superset, datastore.Exact:
+				// Drive by first selector; AND-check remaining in index later
+				ids, err := readRegSelectorsIndex(bs.Selectors[0], scanCursor, pageSize*batchFactor+1)
 				if err != nil {
 					return nil, err
 				}
-				ok := true
-				for _, sel := range full {
-					key := sel.Type + "|" + sel.Value
-					if _, in := reqSet[key]; !in {
-						ok = false
-						break
-					}
-				}
-				if ok {
-					valid[id] = struct{}{}
-				}
-			}
-			if len(valid) == 0 {
-				return resp, nil
-			}
-			selectorIDSet = valid
+				candidateIDs = ids
 
-		case datastore.Exact:
-			// entries must contain exactly the requested selectors (no more, no fewer)
-			// start with Superset candidates then size-check
-			var inter map[string]struct{}
-			for i, s := range req.BySelectors.Selectors {
-				if s == nil {
-					continue
-				}
-				iter := ds.session.Query(selQ, s.Type, s.Value).Iter()
-				cur := make(map[string]struct{})
-				var id string
-				for iter.Scan(&id) {
-					cur[id] = struct{}{}
-				}
-				if err := iter.Close(); err != nil {
-					return nil, newError("failed to query selectors: %v", err)
-				}
-				if i == 0 || inter == nil {
-					inter = cur
-				} else {
-					for k := range inter {
-						if _, ok := cur[k]; !ok {
-							delete(inter, k)
-						}
+			case datastore.Subset, datastore.MatchAny:
+				// SUBSET/MATCHANY need a UNION across *all* requested selectors (fixes "expected 3 got 2")
+				union := make(map[string]struct{})
+				for _, s := range bs.Selectors {
+					ids, err := readRegSelectorsIndex(s, scanCursor, pageSize*batchFactor+1)
+					if err != nil {
+						return nil, err
+					}
+					for _, id := range ids {
+						union[id] = struct{}{}
 					}
 				}
-				if len(inter) == 0 {
-					return resp, nil
+				// Flatten + sort
+				candidateIDs = make([]string, 0, len(union))
+				for id := range union {
+					if id > scanCursor {
+						candidateIDs = append(candidateIDs, id)
+					}
+				}
+				sortStrings(candidateIDs)
+				if len(candidateIDs) > pageSize*batchFactor+1 {
+					candidateIDs = candidateIDs[:pageSize*batchFactor+1]
 				}
 			}
-			// verify equality
-			want := make(map[string]struct{}, len(req.BySelectors.Selectors))
-			for _, s := range req.BySelectors.Selectors {
-				if s == nil {
-					continue
-				}
-				want[s.Type+"|"+s.Value] = struct{}{}
-			}
-			exact := make(map[string]struct{})
-			for id := range inter {
-				full, err := ds.fetchSelectorsByEntryID(ctx, id)
+
+		// Else prefer federates index when provided
+		case req != nil && req.ByFederatesWith != nil && len(req.ByFederatesWith.TrustDomains) > 0:
+			fw := req.ByFederatesWith
+			switch fw.Match {
+			case datastore.Superset, datastore.Exact:
+				ids, err := readFederatesIndex(fw.TrustDomains[0], scanCursor, pageSize*batchFactor+1)
 				if err != nil {
 					return nil, err
 				}
-				if len(full) != len(want) {
-					continue
-				}
-				match := true
-				for _, sel := range full {
-					if _, ok := want[sel.Type+"|"+sel.Value]; !ok {
-						match = false
-						break
+				candidateIDs = ids
+
+			case datastore.Subset, datastore.MatchAny:
+				union := make(map[string]struct{})
+				for _, td := range fw.TrustDomains {
+					ids, err := readFederatesIndex(td, scanCursor, pageSize*batchFactor+1)
+					if err != nil {
+						return nil, err
+					}
+					for _, id := range ids {
+						union[id] = struct{}{}
 					}
 				}
-				if match {
-					exact[id] = struct{}{}
+				candidateIDs = make([]string, 0, len(union))
+				for id := range union {
+					if id > scanCursor {
+						candidateIDs = append(candidateIDs, id)
+					}
+				}
+				sortStrings(candidateIDs)
+				if len(candidateIDs) > pageSize*batchFactor+1 {
+					candidateIDs = candidateIDs[:pageSize*batchFactor+1]
 				}
 			}
-			if len(exact) == 0 {
-				return resp, nil
-			}
-			selectorIDSet = exact
 
+		// Else fall back to the “all ids” scan table
 		default:
-			// Unknown match mode -> empty
-			return resp, nil
+			ids, err := readAllIDs(scanCursor, pageSize*batchFactor+1)
+			if err != nil {
+				return nil, err
+			}
+			candidateIDs = ids
 		}
-	}
 
-	// ================================
-	// ByFederatesWith filter block
-	// ================================
-	var fwIDSet map[string]struct{}
-	if req != nil && req.ByFederatesWith != nil && len(req.ByFederatesWith.TrustDomains) > 0 {
-		const fwQ = `SELECT entry_id FROM federates_with WHERE trust_domain = ? ALLOW FILTERING`
+		if len(candidateIDs) == 0 {
+			break
+		}
 
-		switch req.ByFederatesWith.Match {
-		case datastore.MatchAny:
-			// union across trust domains
-			union := make(map[string]struct{})
-			for _, td := range req.ByFederatesWith.TrustDomains {
-				iter := ds.session.Query(fwQ, td).Iter()
-				var id string
-				for iter.Scan(&id) {
-					union[id] = struct{}{}
-				}
-				if err := iter.Close(); err != nil {
-					return nil, newError("failed to query federates_with: %v", err)
-				}
+		// Secondary AND checks (only for Superset/Exact)
+		selectorAND := func(id string) (bool, error) {
+			bs := req.BySelectors
+			if bs == nil || len(bs.Selectors) <= 1 {
+				return true, nil
 			}
-			if len(union) == 0 {
-				return resp, nil
-			}
-			fwIDSet = union
-
-		case datastore.Superset:
-			// intersection: entry must contain ALL the requested TDs
-			var inter map[string]struct{}
-			for i, td := range req.ByFederatesWith.TrustDomains {
-				iter := ds.session.Query(fwQ, td).Iter()
-				cur := make(map[string]struct{})
-				var id string
-				for iter.Scan(&id) {
-					cur[id] = struct{}{}
-				}
-				if err := iter.Close(); err != nil {
-					return nil, newError("failed to query federates_with: %v", err)
-				}
-				if i == 0 || inter == nil {
-					inter = cur
-				} else {
-					for k := range inter {
-						if _, ok := cur[k]; !ok {
-							delete(inter, k)
+			switch bs.Match {
+			case datastore.Superset, datastore.Exact:
+				for _, s := range bs.Selectors[1:] {
+					var check string
+					err := ds.session.Query(
+						`SELECT entry_id FROM reg_selectors_index
+						 WHERE selector_type = ? AND selector_value = ? AND entry_id = ? LIMIT 1`,
+						s.Type, s.Value, id,
+					).Scan(&check)
+					if err != nil {
+						if err == gocql.ErrNotFound {
+							return false, nil
 						}
+						return false, newError("selector AND check failed: %v", err)
 					}
 				}
-				if len(inter) == 0 {
-					return resp, nil
+				return true, nil
+			default:
+				return true, nil
+			}
+		}
+		fwAND := func(id string) (bool, error) {
+			fw := req.ByFederatesWith
+			if fw == nil || len(fw.TrustDomains) <= 1 {
+				return true, nil
+			}
+			switch fw.Match {
+			case datastore.Superset, datastore.Exact:
+				for _, td := range fw.TrustDomains[1:] {
+					var check string
+					err := ds.session.Query(
+						`SELECT entry_id FROM federates_with_index
+						 WHERE trust_domain = ? AND entry_id = ? LIMIT 1`,
+						td, id,
+					).Scan(&check)
+					if err != nil {
+						if err == gocql.ErrNotFound {
+							return false, nil
+						}
+						return false, newError("federates_with AND check failed: %v", err)
+					}
 				}
+				return true, nil
+			default:
+				return true, nil
 			}
-			fwIDSet = inter
+		}
 
-		case datastore.Subset:
-			// entries whose federates_with set is a SUBSET of requested TDs
-			reqSet := make(map[string]struct{}, len(req.ByFederatesWith.TrustDomains))
-			for _, td := range req.ByFederatesWith.TrustDomains {
-				reqSet[td] = struct{}{}
-			}
+		// Hydrate + filter
+		for _, id := range candidateIDs {
+			scanCursor = id // move cursor forward regardless
 
-			// union candidates
-			candidates := make(map[string]struct{})
-			for _, td := range req.ByFederatesWith.TrustDomains {
-				iter := ds.session.Query(fwQ, td).Iter()
-				var id string
-				for iter.Scan(&id) {
-					candidates[id] = struct{}{}
-				}
-				if err := iter.Close(); err != nil {
-					return nil, newError("failed to query federates_with: %v", err)
-				}
-			}
-			if len(candidates) == 0 {
-				return resp, nil
-			}
-
-			// verify subset
-			valid := make(map[string]struct{})
-			for id := range candidates {
-				full, err := ds.fetchFederatesWithByEntryID(ctx, id)
+			// Index-level AND checks
+			if req != nil && req.BySelectors != nil && (req.BySelectors.Match == datastore.Superset || req.BySelectors.Match == datastore.Exact) {
+				ok, err := selectorAND(id)
 				if err != nil {
 					return nil, err
 				}
-				ok := true
-				for _, td := range full {
-					if _, in := reqSet[td]; !in {
-						ok = false
-						break
-					}
-				}
-				if ok {
-					valid[id] = struct{}{}
-				}
-			}
-			if len(valid) == 0 {
-				return resp, nil
-			}
-			fwIDSet = valid
-
-		case datastore.Exact:
-			// entry TDs must equal requested TDs
-			var inter map[string]struct{}
-			for i, td := range req.ByFederatesWith.TrustDomains {
-				iter := ds.session.Query(fwQ, td).Iter()
-				cur := make(map[string]struct{})
-				var id string
-				for iter.Scan(&id) {
-					cur[id] = struct{}{}
-				}
-				if err := iter.Close(); err != nil {
-					return nil, newError("failed to query federates_with: %v", err)
-				}
-				if i == 0 || inter == nil {
-					inter = cur
-				} else {
-					for k := range inter {
-						if _, ok := cur[k]; !ok {
-							delete(inter, k)
-						}
-					}
-				}
-				if len(inter) == 0 {
-					return resp, nil
-				}
-			}
-			// verify equality
-			want := make(map[string]struct{}, len(req.ByFederatesWith.TrustDomains))
-			for _, td := range req.ByFederatesWith.TrustDomains {
-				want[td] = struct{}{}
-			}
-			exact := make(map[string]struct{})
-			for id := range inter {
-				full, err := ds.fetchFederatesWithByEntryID(ctx, id)
-				if err != nil {
-					return nil, err
-				}
-				if len(full) != len(want) {
+				if !ok {
 					continue
 				}
-				match := true
-				for _, td := range full {
-					if _, ok := want[td]; !ok {
-						match = false
-						break
-					}
+			}
+			if req != nil && req.ByFederatesWith != nil && (req.ByFederatesWith.Match == datastore.Superset || req.ByFederatesWith.Match == datastore.Exact) {
+				ok, err := fwAND(id)
+				if err != nil {
+					return nil, err
 				}
-				if match {
-					exact[id] = struct{}{}
+				if !ok {
+					continue
 				}
 			}
-			if len(exact) == 0 {
-				return resp, nil
+
+			e, err := ds.FetchRegistrationEntry(ctx, id)
+			if err != nil {
+				return nil, err
 			}
-			fwIDSet = exact
-
-		default:
-			return resp, nil
-		}
-	}
-
-	// ----- Compose selector and federates_with filters -----
-	switch {
-	case selectorIDSet != nil && fwIDSet != nil:
-		combined := make(map[string]struct{})
-		for id := range selectorIDSet {
-			if _, ok := fwIDSet[id]; ok {
-				combined[id] = struct{}{}
-			}
-		}
-		if len(combined) == 0 {
-			return resp, nil
-		}
-		restrictToEntryIDs = keys(combined)
-	case selectorIDSet != nil:
-		restrictToEntryIDs = keys(selectorIDSet)
-	case fwIDSet != nil:
-		restrictToEntryIDs = keys(fwIDSet)
-	}
-
-	// ----- Build base query for registered_entries -----
-	baseQ := `SELECT entry_id, spiffe_id, parent_id, x509_svid_ttl, admin, downstream, expiry, store_svid, hint, jwt_svid_ttl, revision_number, created_at FROM registered_entries`
-	where := []string{}
-	args := []interface{}{}
-	needsFiltering := false
-
-	// If we have an ID restriction (from selectors/federates-with), prefer fetching by primary key IN
-	if len(restrictToEntryIDs) > 0 {
-		// Trim to pageSize to keep IN list small (tests are tiny anyway)
-		if int32(len(restrictToEntryIDs)) > pageSize {
-			restrictToEntryIDs = restrictToEntryIDs[:pageSize]
-		}
-		where = append(where, fmt.Sprintf("entry_id IN (%s)", makeQMarks(len(restrictToEntryIDs))))
-		for _, id := range restrictToEntryIDs {
-			args = append(args, id)
-		}
-	} else {
-		// Apply simple filters that are NOT primary-key columns (require ALLOW FILTERING)
-		if req != nil {
-			if req.ByParentID != "" {
-				where = append(where, "parent_id = ?")
-				args = append(args, req.ByParentID)
-				needsFiltering = true
-			}
-			if req.BySpiffeID != "" {
-				where = append(where, "spiffe_id = ?")
-				args = append(args, req.BySpiffeID)
-				needsFiltering = true
-			}
-			if req.ByHint != "" {
-				where = append(where, "hint = ?")
-				args = append(args, req.ByHint)
-				needsFiltering = true
-			}
-			if req.ByDownstream != nil {
-				where = append(where, "downstream = ?")
-				args = append(args, *req.ByDownstream)
-				needsFiltering = true
-			}
-		}
-	}
-
-	q := baseQ
-	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
-	}
-	// IMPORTANT: ALLOW FILTERING placement vs LIMIT
-	if needsFiltering && len(restrictToEntryIDs) == 0 {
-		// Use ALLOW FILTERING and DO NOT add LIMIT (avoid grammar error)
-		q += " ALLOW FILTERING"
-	} else {
-		// Safe to use LIMIT (primary-key path)
-		q += " LIMIT ?"
-		args = append(args, pageSize)
-	}
-
-	cq := ds.session.Query(q, args...)
-	if len(pagingState) > 0 {
-		cq = cq.PageState(pagingState)
-	}
-	iter := cq.Iter()
-
-	var (
-		entryID        string
-		spiffeID       string
-		parentID       string
-		x509SvidTtl    int32
-		admin          bool
-		downstream     bool
-		expiry         int64
-		storeSvid      bool
-		hint           string
-		jwtSvidTtl     int32
-		revisionNumber int64
-		createdAt      time.Time
-	)
-	type RegEntryModel struct {
-		EntryID        string
-		SpiffeID       string
-		ParentID       string
-		X509SvidTtl    int32
-		Admin          bool
-		Downstream     bool
-		Expiry         int64
-		StoreSvid      bool
-		Hint           string
-		JwtSvidTtl     int32
-		RevisionNumber int64
-		CreatedAt      time.Time
-	}
-	var models []RegEntryModel
-	for iter.Scan(&entryID, &spiffeID, &parentID, &x509SvidTtl, &admin, &downstream, &expiry, &storeSvid, &hint, &jwtSvidTtl, &revisionNumber, &createdAt) {
-		models = append(models, RegEntryModel{
-			EntryID: entryID, SpiffeID: spiffeID, ParentID: parentID, X509SvidTtl: x509SvidTtl,
-			Admin: admin, Downstream: downstream, Expiry: expiry, StoreSvid: storeSvid, Hint: hint,
-			JwtSvidTtl: jwtSvidTtl, RevisionNumber: revisionNumber, CreatedAt: createdAt,
-		})
-	}
-	if err := iter.Close(); err != nil {
-		return nil, newError("failed to iterate registration entries: %v", err)
-	}
-	nextPagingState := iter.PageState()
-
-	// If we used IN(...) and also had simple filters, apply them in-memory here.
-	if len(restrictToEntryIDs) > 0 && req != nil {
-		filtered := models[:0]
-		for _, m := range models {
-			if req.ByParentID != "" && m.ParentID != req.ByParentID {
+			if e == nil {
 				continue
 			}
-			if req.BySpiffeID != "" && m.SpiffeID != req.BySpiffeID {
-				continue
-			}
-			if req.ByHint != "" && m.Hint != req.ByHint {
-				continue
-			}
-			if req.ByDownstream != nil && m.Downstream != *req.ByDownstream {
-				continue
-			}
-			filtered = append(filtered, m)
-		}
-		models = filtered
-	}
 
-	// Hydrate details
-	for _, m := range models {
-		selectors, err := ds.fetchSelectorsByEntryID(ctx, m.EntryID)
-		if err != nil {
-			return nil, err
-		}
-		// Ensure deterministic order to match sqlstore expectations
-		sort.Slice(selectors, func(i, j int) bool {
-			if selectors[i].Type == selectors[j].Type {
-				return selectors[i].Value < selectors[j].Value
+			// Simple filters
+			if req != nil {
+				if req.ByParentID != "" && e.ParentId != req.ByParentID {
+					continue
+				}
+				if req.BySpiffeID != "" && e.SpiffeId != req.BySpiffeID {
+					continue
+				}
+				if req.ByHint != "" && e.Hint != req.ByHint {
+					continue
+				}
+				if req.ByDownstream != nil && e.Downstream != *req.ByDownstream {
+					continue
+				}
 			}
-			return selectors[i].Type < selectors[j].Type
-		})
 
-		dnsNames, err := ds.fetchDNSNamesByEntryID(ctx, m.EntryID)
-		if err != nil {
-			return nil, err
-		}
-		if len(dnsNames) == 0 {
-			dnsNames = nil
+			// Full selector/federates semantics
+			if req != nil && req.BySelectors != nil && len(req.BySelectors.Selectors) > 0 {
+				if !matchSelectors(e.Selectors, req.BySelectors) {
+					continue
+				}
+			}
+			if req != nil && req.ByFederatesWith != nil && len(req.ByFederatesWith.TrustDomains) > 0 {
+				if !matchFederates(e.FederatesWith, req.ByFederatesWith) {
+					continue
+				}
+			}
+
+			// Normalize for test equality
+			if len(e.Selectors) > 0 {
+				sortSelectors(e.Selectors)
+			}
+			if len(e.FederatesWith) > 0 {
+				sortStrings(e.FederatesWith)
+			}
+			if len(e.DnsNames) == 0 {
+				e.DnsNames = nil
+			}
+			if len(e.FederatesWith) == 0 {
+				e.FederatesWith = nil
+			}
+
+			resp.Entries = append(resp.Entries, e)
+			collected++
+			nextToken = e.EntryId
+			if collected == pageSize {
+				break
+			}
 		}
 
-		federatesWith, err := ds.fetchFederatesWithByEntryID(ctx, m.EntryID)
-		if err != nil {
-			return nil, err
+		if collected == pageSize || len(candidateIDs) < pageSize*batchFactor+1 {
+			break
 		}
-		if len(federatesWith) == 0 {
-			federatesWith = nil
-		}
-
-		resp.Entries = append(resp.Entries, &common.RegistrationEntry{
-			EntryId:        m.EntryID,
-			Selectors:      selectors,
-			SpiffeId:       m.SpiffeID,
-			ParentId:       m.ParentID,
-			X509SvidTtl:    m.X509SvidTtl,
-			FederatesWith:  federatesWith,
-			Admin:          m.Admin,
-			Downstream:     m.Downstream,
-			EntryExpiry:    m.Expiry,
-			DnsNames:       dnsNames,
-			RevisionNumber: m.RevisionNumber,
-			StoreSvid:      m.StoreSvid,
-			JwtSvidTtl:     m.JwtSvidTtl,
-			Hint:           m.Hint,
-			CreatedAt:      m.CreatedAt.Unix(),
-		})
 	}
 
 	if req != nil && req.Pagination != nil {
-		if len(nextPagingState) > 0 {
-			resp.Pagination = &datastore.Pagination{
-				Token:    string(nextPagingState),
-				PageSize: req.Pagination.PageSize,
-			}
-		} else if len(models) > 0 {
-			resp.Pagination = &datastore.Pagination{
-				PageSize: req.Pagination.PageSize,
-			}
+		resp.Pagination = &datastore.Pagination{
+			PageSize: int32(pageSize),
+			Token:    "",
+		}
+		if collected == pageSize && nextToken != "" {
+			resp.Pagination.Token = nextToken
 		}
 	}
 
 	return resp, nil
 }
 
-// helper: returns "?, ?, ?, ?" of length n
-func makeQMarks(n int) string {
-	if n <= 0 {
-		return ""
-	}
-	var b strings.Builder
-	for i := 0; i < n; i++ {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString("?")
-	}
-	return b.String()
-}
-
-// UpdateRegistrationEntry updates an existing registration entry
+// UpdateRegistrationEntry updates an existing registration entry (and secondary indexes).
 func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *common.RegistrationEntry, mask *common.RegistrationEntryMask) (*common.RegistrationEntry, error) {
 	if e == nil {
 		return nil, newError("invalid request: missing registration entry")
@@ -914,8 +640,6 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 	if e.EntryId == "" {
 		return nil, newError("invalid request: missing registration entry ID")
 	}
-
-	// Default: update all fields when mask is nil (matches SQLStore tests)
 	if mask == nil {
 		mask = &common.RegistrationEntryMask{
 			Selectors:     true,
@@ -933,57 +657,38 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		}
 	}
 
-	// -------------------------------
-	// Validation (final tuned behavior for all test suites)
-	// -------------------------------
-	if mask.SpiffeId {
-		if e.SpiffeId == "" {
-			return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: missing SPIFFE ID")
-		}
+	// Field validation (mirrors prior behavior)
+	if mask.SpiffeId && e.SpiffeId == "" {
+		return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: missing SPIFFE ID")
 	}
-
-	// Only fail if explicitly invalid (negative), not when zero/unspecified
-	if mask.X509SvidTtl {
-		if e.X509SvidTtl < 0 {
-			return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: X509SvidTtl is not set")
-		}
+	if mask.X509SvidTtl && e.X509SvidTtl < 0 {
+		return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: X509SvidTtl is not set")
 	}
-
-	if mask.JwtSvidTtl {
-		if e.JwtSvidTtl < 0 {
-			return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: JwtSvidTtl is not set")
-		}
+	if mask.JwtSvidTtl && e.JwtSvidTtl < 0 {
+		return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: JwtSvidTtl is not set")
 	}
-
-	if mask.Selectors {
-		if len(e.Selectors) == 0 {
-			return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: missing selector list")
-		}
+	if mask.Selectors && len(e.Selectors) == 0 {
+		return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: missing selector list")
 	}
-
-	if mask.StoreSvid && e.StoreSvid {
-		// When StoreSVID is enabled, all selector types must be the same
-		if len(e.Selectors) > 1 {
-			firstType := e.Selectors[0].Type
-			for _, s := range e.Selectors[1:] {
-				if s.Type != firstType {
-					return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: selector types must be the same when store SVID is enabled")
-				}
+	if mask.StoreSvid && e.StoreSvid && len(e.Selectors) > 1 {
+		firstType := e.Selectors[0].Type
+		for _, s := range e.Selectors[1:] {
+			if s.Type != firstType {
+				return nil, newInvalidArgumentError("datastore-validation: invalid registration entry: selector types must be the same when store SVID is enabled")
 			}
 		}
 	}
-	// -------------------------------
 
-	// Fetch existing entry
-	existingEntry, err := ds.FetchRegistrationEntry(ctx, e.EntryId)
+	// Fetch current (for index deletions & revision)
+	cur, err := ds.FetchRegistrationEntry(ctx, e.EntryId)
 	if err != nil {
 		return nil, err
 	}
-	if existingEntry == nil {
+	if cur == nil {
 		return nil, newNotFoundError("datastore-sql: record not found: %s", e.EntryId)
 	}
 
-	// Validate FederatesWith bundles if changed
+	// Validate federated bundles if changed
 	if mask.FederatesWith && len(e.FederatesWith) > 0 {
 		for _, td := range e.FederatesWith {
 			var count int64
@@ -997,7 +702,7 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 		}
 	}
 
-	// Revision bump
+	// Read rev & created_at, then bump rev
 	var currentRev int64
 	var createdAt time.Time
 	const selQ = `SELECT revision_number, created_at FROM registered_entries WHERE entry_id = ?`
@@ -1010,66 +715,72 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 	newRev := currentRev + 1
 	now := time.Now()
 
-	setClauses := make([]string, 0, 12)
+	set := make([]string, 0, 12)
 	args := make([]interface{}, 0, 14)
 
 	if mask.SpiffeId {
-		setClauses = append(setClauses, "spiffe_id = ?")
+		set = append(set, "spiffe_id = ?")
 		args = append(args, e.SpiffeId)
 	}
 	if mask.ParentId {
-		setClauses = append(setClauses, "parent_id = ?")
+		set = append(set, "parent_id = ?")
 		args = append(args, e.ParentId)
 	}
 	if mask.X509SvidTtl {
-		setClauses = append(setClauses, "x509_svid_ttl = ?")
+		set = append(set, "x509_svid_ttl = ?")
 		args = append(args, e.X509SvidTtl)
 	}
 	if mask.Admin {
-		setClauses = append(setClauses, "admin = ?")
+		set = append(set, "admin = ?")
 		args = append(args, e.Admin)
 	}
 	if mask.Downstream {
-		setClauses = append(setClauses, "downstream = ?")
+		set = append(set, "downstream = ?")
 		args = append(args, e.Downstream)
 	}
 	if mask.EntryExpiry {
-		setClauses = append(setClauses, "expiry = ?")
+		set = append(set, "expiry = ?")
 		args = append(args, e.EntryExpiry)
 	}
 	if mask.StoreSvid {
-		setClauses = append(setClauses, "store_svid = ?")
+		set = append(set, "store_svid = ?")
 		args = append(args, e.StoreSvid)
 	}
 	if mask.JwtSvidTtl {
-		setClauses = append(setClauses, "jwt_svid_ttl = ?")
+		set = append(set, "jwt_svid_ttl = ?")
 		args = append(args, e.JwtSvidTtl)
 	}
 	if mask.Hint {
-		setClauses = append(setClauses, "hint = ?")
+		set = append(set, "hint = ?")
 		args = append(args, e.Hint)
 	}
 
-	// Always bump revision + updated_at
-	setClauses = append(setClauses, "revision_number = ?", "updated_at = ?")
+	set = append(set, "revision_number = ?", "updated_at = ?")
 	args = append(args, newRev, now)
 
-	// Update registered_entries
-	query := "UPDATE registered_entries SET " + strings.Join(setClauses, ", ") + " WHERE entry_id = ?"
+	q := "UPDATE registered_entries SET " + strings.Join(set, ", ") + " WHERE entry_id = ?"
 	args = append(args, e.EntryId)
-	if err := ds.session.Query(query, args...).Exec(); err != nil {
+	if err := ds.session.Query(q, args...).Exec(); err != nil {
 		return nil, newError("failed to update registration entry: %v", err)
 	}
 
-	// Update related tables based on mask
+	// Child tables + secondary indexes
 	if mask.Selectors {
+		// delete old selector rows + index rows, then insert new
 		if err := ds.deleteSelectorsByEntryID(e.EntryId); err != nil {
+			return nil, err
+		}
+		if err := ds.deleteRegSelectorsIndex(e.EntryId, cur.Selectors); err != nil {
 			return nil, err
 		}
 		if err := ds.insertSelectors(e.EntryId, e.Selectors); err != nil {
 			return nil, err
 		}
+		if err := ds.insertRegSelectorsIndex(e.EntryId, e.Selectors); err != nil {
+			return nil, err
+		}
 	}
+
 	if mask.DnsNames {
 		if err := ds.deleteDNSNamesByEntryID(e.EntryId); err != nil {
 			return nil, err
@@ -1078,41 +789,42 @@ func (ds *CassandraDataStore) UpdateRegistrationEntry(ctx context.Context, e *co
 			return nil, err
 		}
 	}
+
 	if mask.FederatesWith {
 		if err := ds.deleteFederatesWithByEntryID(e.EntryId); err != nil {
+			return nil, err
+		}
+		if err := ds.deleteFederatesWithIndex(e.EntryId, cur.FederatesWith); err != nil {
 			return nil, err
 		}
 		if err := ds.insertFederatesWith(e.EntryId, e.FederatesWith); err != nil {
 			return nil, err
 		}
+		if err := ds.insertFederatesWithIndex(e.EntryId, e.FederatesWith); err != nil {
+			return nil, err
+		}
 	}
 
-	// Emit event
+	// Event
 	if err := ds.createRegistrationEntryEventForEntryID(e.EntryId); err != nil {
 		return nil, newError("failed to create registration entry event: %v", err)
 	}
 
-	// Return updated object
-	updatedEntry, err := ds.FetchRegistrationEntry(ctx, e.EntryId)
-	if err != nil {
-		return nil, err
-	}
-	return updatedEntry, nil
+	return ds.FetchRegistrationEntry(ctx, e.EntryId)
 }
 
-// DeleteRegistrationEntry deletes the given registration entry
+// DeleteRegistrationEntry deletes the given registration entry (with secondary index cleanup).
 func (ds *CassandraDataStore) DeleteRegistrationEntry(ctx context.Context, entryID string) (*common.RegistrationEntry, error) {
-	// First fetch the entry to return it
-	existingEntry, err := ds.FetchRegistrationEntry(ctx, entryID)
+	// Fetch existing to return & to remove index rows
+	existing, err := ds.FetchRegistrationEntry(ctx, entryID)
 	if err != nil {
 		return nil, err
 	}
-
-	if existingEntry == nil {
+	if existing == nil {
 		return nil, newNotFoundError("record not found: %s", entryID)
 	}
 
-	// Delete related data first
+	// Child tables
 	if err := ds.deleteSelectorsByEntryID(entryID); err != nil {
 		return nil, err
 	}
@@ -1123,18 +835,29 @@ func (ds *CassandraDataStore) DeleteRegistrationEntry(ctx context.Context, entry
 		return nil, err
 	}
 
-	// Delete the entry itself
-	const deleteQ = `DELETE FROM registered_entries WHERE entry_id = ?`
-	if err := ds.session.Query(deleteQ, entryID).Exec(); err != nil {
+	// Secondary indexes
+	if err := ds.deleteRegSelectorsIndex(entryID, existing.Selectors); err != nil {
+		return nil, err
+	}
+	if err := ds.deleteFederatesWithIndex(entryID, existing.FederatesWith); err != nil {
+		return nil, err
+	}
+	if err := ds.deleteRegAllIDs(entryID); err != nil {
+		return nil, err
+	}
+
+	// Base row
+	const del = `DELETE FROM registered_entries WHERE entry_id = ?`
+	if err := ds.session.Query(del, entryID).Exec(); err != nil {
 		return nil, newError("failed to delete registration entry: %v", err)
 	}
 
-	// Emit a deletion event for auditability
+	// Event
 	if err := ds.createRegistrationEntryEventForEntryID(entryID); err != nil {
 		return nil, newError("failed to create registration entry event: %v", err)
 	}
 
-	return existingEntry, nil
+	return existing, nil
 }
 
 // PruneRegistrationEntries takes a registration entry message, and deletes all entries which have expired
@@ -1471,15 +1194,106 @@ func (ds *CassandraDataStore) lookupSimilarEntry(ctx context.Context, entry *com
 	return nil, nil
 }
 
-// Helper function to join strings with a separator
-func joinStrings(slice []string, sep string) string {
-	if len(slice) == 0 {
-		return ""
+// Helper: write reg_selectors_index rows for an entry
+func (ds *CassandraDataStore) insertRegSelectorIndex(entryID string, selectors []*common.Selector) error {
+	if len(selectors) == 0 {
+		return nil
 	}
+	const q = `INSERT INTO reg_selectors_index (selector_type, selector_value, entry_id) VALUES (?, ?, ?)`
+	for _, s := range selectors {
+		if err := ds.session.Query(q, s.Type, s.Value, entryID).Exec(); err != nil {
+			return newError("failed to upsert reg_selectors_index: %v", err)
+		}
+	}
+	return nil
+}
 
-	result := slice[0]
-	for _, s := range slice[1:] {
-		result += sep + s
+// Helper: delete reg_selectors_index rows for an entry (requires old selectors)
+func (ds *CassandraDataStore) deleteRegSelectorIndexByEntryID(entryID string, oldSelectors []*common.Selector) error {
+	if len(oldSelectors) == 0 {
+		return nil
 	}
-	return result
+	const q = `DELETE FROM reg_selectors_index WHERE selector_type = ? AND selector_value = ? AND entry_id = ?`
+	for _, s := range oldSelectors {
+		if err := ds.session.Query(q, s.Type, s.Value, entryID).Exec(); err != nil {
+			return newError("failed to delete reg_selectors_index: %v", err)
+		}
+	}
+	return nil
+}
+
+// Helper: delete federates_with_index rows for an entry (requires old TDs)
+func (ds *CassandraDataStore) deleteFederatesWithIndexByEntryID(entryID string, oldTDs []string) error {
+	if len(oldTDs) == 0 {
+		return nil
+	}
+	const q = `DELETE FROM federates_with_index WHERE trust_domain = ? AND entry_id = ?`
+	for _, td := range oldTDs {
+		if err := ds.session.Query(q, td, entryID).Exec(); err != nil {
+			return newError("failed to delete federates_with_index: %v", err)
+		}
+	}
+	return nil
+}
+
+// Helper: insert rows into reg_selectors_index (selector_type, selector_value) -> entry_id
+func (ds *CassandraDataStore) insertRegSelectorsIndex(entryID string, selectors []*common.Selector) error {
+	if len(selectors) == 0 {
+		return nil
+	}
+	const q = `INSERT INTO reg_selectors_index (selector_type, selector_value, entry_id) VALUES (?, ?, ?)`
+	for _, s := range selectors {
+		if s == nil {
+			continue
+		}
+		if err := ds.session.Query(q, s.Type, s.Value, entryID).Exec(); err != nil {
+			return newError("failed to upsert reg_selectors_index: %v", err)
+		}
+	}
+	return nil
+}
+
+// Helper: delete rows from reg_selectors_index for a specific entry (requires old selectors)
+func (ds *CassandraDataStore) deleteRegSelectorsIndex(entryID string, selectors []*common.Selector) error {
+	if len(selectors) == 0 {
+		return nil
+	}
+	const q = `DELETE FROM reg_selectors_index WHERE selector_type = ? AND selector_value = ? AND entry_id = ?`
+	for _, s := range selectors {
+		if s == nil {
+			continue
+		}
+		if err := ds.session.Query(q, s.Type, s.Value, entryID).Exec(); err != nil {
+			return newError("failed to delete reg_selectors_index: %v", err)
+		}
+	}
+	return nil
+}
+
+// Helper: insert rows into federates_with_index (trust_domain) -> entry_id
+func (ds *CassandraDataStore) insertFederatesWithIndex(entryID string, tds []string) error {
+	if len(tds) == 0 {
+		return nil
+	}
+	const q = `INSERT INTO federates_with_index (trust_domain, entry_id) VALUES (?, ?)`
+	for _, td := range tds {
+		if err := ds.session.Query(q, td, entryID).Exec(); err != nil {
+			return newError("failed to upsert federates_with_index: %v", err)
+		}
+	}
+	return nil
+}
+
+// Helper: delete rows from federates_with_index for a specific entry (requires old TDs)
+func (ds *CassandraDataStore) deleteFederatesWithIndex(entryID string, tds []string) error {
+	if len(tds) == 0 {
+		return nil
+	}
+	const q = `DELETE FROM federates_with_index WHERE trust_domain = ? AND entry_id = ?`
+	for _, td := range tds {
+		if err := ds.session.Query(q, td, entryID).Exec(); err != nil {
+			return newError("failed to delete federates_with_index: %v", err)
+		}
+	}
+	return nil
 }

@@ -922,7 +922,6 @@ func diffSelectors(old, neu []*common.Selector) (add, del []*common.Selector) {
 }
 
 // decode/encode page tokens (Cassandra paging state)
-func encodePageToken(b []byte) string { return base64.RawStdEncoding.EncodeToString(b) }
 func decodePageToken(s string) []byte {
 	b, _ := base64.RawStdEncoding.DecodeString(s)
 	return b

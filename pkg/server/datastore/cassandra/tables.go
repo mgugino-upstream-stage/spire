@@ -85,6 +85,34 @@ var TableDefinitions = []string{
 		updated_at timestamp
 	);`,
 
+	`CREATE TABLE IF NOT EXISTS registered_entries_by_id (
+  bucket   text,                  -- always 'registered_entries'
+  entry_id text,
+  PRIMARY KEY ((bucket), entry_id)
+) WITH CLUSTERING ORDER BY (entry_id ASC);`,
+
+	`-- Selector index for registration entries
+CREATE TABLE IF NOT EXISTS reg_selectors_index (
+  selector_type  text,
+  selector_value text,
+  entry_id       text,
+  PRIMARY KEY ((selector_type, selector_value), entry_id)
+) WITH CLUSTERING ORDER BY (entry_id ASC);`,
+
+	`-- Federates-with index (trust_domain -> entry_id)
+CREATE TABLE IF NOT EXISTS federates_with_index (
+  trust_domain text,
+  entry_id     text,
+  PRIMARY KEY ((trust_domain), entry_id)
+)WITH CLUSTERING ORDER BY (entry_id ASC);`,
+
+	`-- All-IDs scan table for ordered paging
+CREATE TABLE IF NOT EXISTS registered_entries_scan (
+  bucket   text,     -- always 'registered_entries_scan'
+  entry_id text,
+  PRIMARY KEY ((bucket), entry_id)
+) WITH CLUSTERING ORDER BY (entry_id ASC);`,
+
 	// Registration entry selectors table
 	`CREATE TABLE IF NOT EXISTS selectors (
 		entry_id text,
